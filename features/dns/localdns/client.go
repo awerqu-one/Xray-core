@@ -32,7 +32,7 @@ func (*Client) Close() error { return nil }
 func (c *Client) LookupIP(host string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var ips []net.IP
 	var err error
-	if len(internet.Controllers) > 0 {
+	if len(internet.DialerControllers()) > 0 {
 		ips, err = c.r.LookupIP(context.Background(), "ip", host)
 	} else {
 		ips, err = net.LookupIP(host)
@@ -81,7 +81,7 @@ func New() *Client {
 		Timeout: time.Second * 16,
 		Control: func(network, address string, c syscall.RawConn) error {
 			var errs []error
-			for _, ctl := range internet.Controllers {
+			for _, ctl := range internet.DialerControllers() {
 				if err := ctl(network, address, c); err != nil {
 					errs = append(errs, err)
 				}

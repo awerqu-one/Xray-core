@@ -34,6 +34,7 @@ var (
 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
 		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
 		"masque":        func() interface{} { return new(MasqueServerConfig) },
+		"raywire":       func() interface{} { return new(RaywireServerConfig) },
 		"tun":           func() interface{} { return new(TunConfig) },
 	}, "protocol", "settings")
 
@@ -51,6 +52,7 @@ var (
 		"trojan":      func() interface{} { return new(TrojanClientConfig) },
 		"hysteria":    func() interface{} { return new(HysteriaClientConfig) },
 		"masque":      func() interface{} { return new(MasqueClientConfig) },
+		"raywire":     func() interface{} { return new(RaywireClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
 	}, "protocol", "settings")

@@ -22,25 +22,35 @@ type ConnRF struct {
 	net.Conn
 	Req   *http.Request
 	First bool
+	// reader holds bytes that arrived together with the 101 reply; nil once drained
+	reader *bufio.Reader
 }
 
 func (c *ConnRF) Read(b []byte) (int, error) {
 	if c.First {
 		c.First = false
-		// create reader capped to size of `b`, so it can be fully drained into
-		// `b` later with a single Read call
-		reader := bufio.NewReaderSize(c.Conn, len(b))
-		resp, err := http.ReadResponse(reader, c.Req) // nolint:bodyclose
+		c.reader = bufio.NewReaderSize(c.Conn, len(b))
+		resp, err := http.ReadResponse(c.reader, c.Req) // nolint:bodyclose
 		if err != nil {
+			c.reader = nil
 			return 0, err
 		}
 		if resp.Status != "101 Switching Protocols" ||
 			strings.ToLower(resp.Header.Get("Upgrade")) != "websocket" ||
 			strings.ToLower(resp.Header.Get("Connection")) != "upgrade" {
+			c.reader = nil
 			return 0, errors.New("unrecognized reply")
 		}
-		// drain remaining bufreader
-		return reader.Read(b[:reader.Buffered()])
+	}
+	// payload read ahead of the reply goes first, then the raw connection takes over
+	if c.reader != nil {
+		if c.reader.Buffered() > 0 {
+			return c.reader.Read(b)
+		}
+		c.reader = nil
+	}
+	if len(b) == 0 {
+		return 0, nil
 	}
 	return c.Conn.Read(b)
 }

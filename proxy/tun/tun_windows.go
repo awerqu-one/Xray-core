@@ -393,7 +393,7 @@ type savedResolver struct {
 func resolveOnOwn() *savedResolver {
 	saved := &savedResolver{net.DefaultResolver.PreferGo, net.DefaultResolver.Dial}
 	dialer := &net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
-		for _, ctl := range internet.Controllers {
+		for _, ctl := range internet.DialerControllers() {
 			if err := ctl(network, address, c); err != nil {
 				return err
 			}

@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
 	github.com/cloudflare/circl v1.6.5
+	github.com/flynn/noise v1.1.0
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
 	github.com/golang/mock v1.7.0-rc.1
 	github.com/google/go-cmp v0.7.0

@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package xray.proxy.raywire;
+
+option go_package = "github.com/xtls/xray-core/proxy/raywire";
+
+// Account is a client static public key that the server accepts.
+message Account {
+  bytes public_key = 1;
+  // Optional email of the client. Connections from this client are counted
+  // under this user in the stats, which need "stats": {} and
+  // policy.levels.0.statsUserUplink and statsUserDownlink set to true. Empty
+  // means an anonymous user (level 0, no email), so a client without an email
+  // has no per-user counter.
+  string email = 2;
+}
+
+// Padding is the random size added to the wire. A nil Padding message means
+// the defaults (handshake 255, frame 32, bucket 0). A present message holds
+// explicit values, and 0 means off.
+message Padding {
+  // Random bytes on msg1 and msg2, uniform in [0, handshake]. At most 512.
+  uint32 handshake = 1;
+  // Random extra bytes per data and end-of-stream frame, uniform in [0, frame].
+  // Ignored when bucket is non-zero. At most 1024.
+  uint32 frame = 2;
+  // Frame block size: 0 = off, otherwise 16..4096. Each data and end-of-stream
+  // frame body is rounded up to a multiple of bucket.
+  uint32 bucket = 3;
+}
+
+message ClientConfig {
+  string address = 1;
+  uint32 port = 2;
+  // Client static X25519 private key (32 bytes).
+  bytes private_key = 3;
+  // Server static X25519 public key (32 bytes), pinned by the client.
+  bytes server_public_key = 4;
+  // Padding settings. Nil means the defaults.
+  Padding padding = 5;
+  // Pre-shared key (32 bytes). Required. Every client of this inbound must hold
+  // the same value.
+  bytes psk = 6;
+}
+
+message ServerConfig {
+  // Server static X25519 private key (32 bytes).
+  bytes private_key = 1;
+  repeated Account clients = 2;
+  // Padding settings. Nil means the defaults.
+  Padding padding = 3;
+  // host:port of the decoy that receives every unauthenticated connection.
+  // Required unless allow_silent_close is set.
+  string fallback = 4;
+  // When true, an empty fallback is allowed. A failed connection is then closed
+  // at the failure point, which is a probe signal on raw TCP.
+  bool allow_silent_close = 5;
+  // Pre-shared key (32 bytes). Required. Every client of this inbound must hold
+  // the same value. A process with several inbounds has one psk per inbound.
+  bytes psk = 6;
+  // Previous pre-shared key (32 bytes), optional. Heads that verify under it are
+  // accepted alongside psk until previous_psk_until. It must differ from psk.
+  bytes previous_psk = 7;
+  // Unix time, in seconds, after which previous_psk is no longer accepted. Required
+  // with previous_psk and at most 14 days ahead when the server loads. Server-side
+  // configuration only; it is not on the wire.
+  int64 previous_psk_until = 8;
+}

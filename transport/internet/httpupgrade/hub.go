@@ -100,7 +100,10 @@ func (s *server) upgrade(conn net.Conn) (stat.Connection, error) {
 	}
 	remoteAddr = http_proto.ApplyTrustedXForwardedFor(req.Header, trustedXFF, remoteAddr)
 
-	return stat.Connection(newConnection(conn, remoteAddr)), nil
+	// the request reader may have read ahead into the payload, keep those bytes
+	// (Peek within Buffered never reads from the socket, so the limit is not hit)
+	pending, _ := connReader.Peek(connReader.Buffered())
+	return stat.Connection(newConnection(conn, remoteAddr, pending)), nil
 }
 
 func (s *server) keepAccepting() {

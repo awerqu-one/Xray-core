@@ -164,7 +164,7 @@ func getDefaultFinalRule(inbound *session.Inbound) *FinalRule {
 	switch inbound.Name {
 	case "vless-reverse":
 		return defaultBlockAllRule
-	case "vless", "vmess", "trojan", "hysteria", "wireguard":
+	case "vless", "vmess", "trojan", "hysteria", "wireguard", "raywire":
 		return defaultBlockPrivateRule
 	default:
 		if strings.HasPrefix(inbound.Name, "shadowsocks") {
@@ -418,6 +418,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process request").Base(err)
+		}
+
+		// Tell the destination that the request is complete, so it can still
+		// send its response (half-close).
+		if destination.Network == net.Network_TCP {
+			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			}
 		}
 
 		return nil

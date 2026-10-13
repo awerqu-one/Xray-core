@@ -186,6 +186,10 @@ func Test_listenHTTPUpgradeAndDial_TLS(t *testing.T) {
 	start := time.Now()
 
 	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+	// one-time loading: otherwise the certificate hot-reload goroutine of transport/internet/tls
+	// rewrites the certificate list while the handshake reads it, which -race reports
+	certificate := tls.ParseCertificate(ct)
+	certificate.OneTimeLoading = true
 
 	streamSettings := &internet.MemoryStreamConfig{
 		ProtocolName: "httpupgrade",
@@ -194,7 +198,7 @@ func Test_listenHTTPUpgradeAndDial_TLS(t *testing.T) {
 		},
 		SecurityType: "tls",
 		SecuritySettings: &tls.Config{
-			Certificate:          []*tls.Certificate{tls.ParseCertificate(ct)},
+			Certificate:          []*tls.Certificate{certificate},
 			PinnedPeerCertSha256: [][]byte{ctHash[:]},
 		},
 	}

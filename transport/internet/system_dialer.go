@@ -13,8 +13,13 @@ import (
 )
 
 var (
+	// Controllers mirrors the registered dialer controllers for code that
+	// reads it directly. It is replaced, never modified in place; readers
+	// inside Xray use DialerControllers, which takes ControllersLock.
 	Controllers           []func(network, address string, c syscall.RawConn) error
 	ControllersLock       sync.Mutex
+	controllerIDs         []uint64
+	nextControllerID      uint64
 	effectiveSystemDialer SystemDialer = &DefaultSystemDialer{}
 )
 
@@ -69,9 +74,12 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		}
 		var lc net.ListenConfig
 		lc.Control = func(network, address string, c syscall.RawConn) error {
-			for _, ctl := range Controllers {
+			for _, ctl := range DialerControllers() {
 				if err := ctl(network, address, c); err != nil {
-					errors.LogInfoInner(ctx, err, "failed to apply external controller")
+					// A socket the controller could not protect or bind
+					// must not be used: it would follow the default route,
+					// which may lead back into the tunnel.
+					return errors.New("failed to apply external controller").Base(err)
 				}
 			}
 			return c.Control(func(fd uintptr) {
@@ -121,14 +129,17 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		KeepAliveConfig: keepAliveConfig,
 	}
 
-	if sockopt != nil || len(Controllers) > 0 {
+	if sockopt != nil || len(DialerControllers()) > 0 {
 		if sockopt != nil && sockopt.TcpMptcp {
 			dialer.SetMultipathTCP(true)
 		}
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			for _, ctl := range Controllers {
+			for _, ctl := range DialerControllers() {
 				if err := ctl(network, address, c); err != nil {
-					errors.LogInfoInner(ctx, err, "failed to apply external controller")
+					// A socket the controller could not protect or bind
+					// must not be used: it would follow the default route,
+					// which may lead back into the tunnel.
+					return errors.New("failed to apply external controller").Base(err)
 				}
 			}
 			return c.Control(func(fd uintptr) {
@@ -183,24 +194,54 @@ func UseAlternativeSystemDialer(dialer SystemDialer) {
 
 // RegisterDialerController adds a controller to the effective system dialer.
 // The controller can be used to operate on file descriptors before they are put into use.
+// An error from the controller aborts the dial.
 // It only works when effective dialer is the default dialer.
 //
 // xray:api:beta
 func RegisterDialerController(ctl func(network, address string, c syscall.RawConn) error) error {
+	_, err := AddDialerController(ctl)
+	return err
+}
+
+// AddDialerController is RegisterDialerController that also returns a function
+// removing the controller again. The remove function may be called more than once.
+//
+// xray:api:beta
+func AddDialerController(ctl func(network, address string, c syscall.RawConn) error) (remove func(), err error) {
 	if ctl == nil {
-		return errors.New("nil listener controller")
+		return nil, errors.New("nil listener controller")
+	}
+	if _, ok := effectiveSystemDialer.(*DefaultSystemDialer); !ok {
+		return nil, errors.New("RegisterListenerController not supported in custom dialer")
 	}
 
 	ControllersLock.Lock()
-	Controllers = append(Controllers, ctl)
+	nextControllerID++
+	id := nextControllerID
+	Controllers = append(append([]func(network, address string, c syscall.RawConn) error(nil), Controllers...), ctl)
+	controllerIDs = append(append([]uint64(nil), controllerIDs...), id)
 	ControllersLock.Unlock()
 
-	_, ok := effectiveSystemDialer.(*DefaultSystemDialer)
-	if !ok {
-		return errors.New("RegisterListenerController not supported in custom dialer")
-	}
+	return func() {
+		ControllersLock.Lock()
+		defer ControllersLock.Unlock()
+		for i, have := range controllerIDs {
+			if have != id {
+				continue
+			}
+			Controllers = append(append([]func(network, address string, c syscall.RawConn) error(nil), Controllers[:i]...), Controllers[i+1:]...)
+			controllerIDs = append(append([]uint64(nil), controllerIDs[:i]...), controllerIDs[i+1:]...)
+			return
+		}
+	}, nil
+}
 
-	return nil
+// DialerControllers returns the registered dialer controllers. The slice is a
+// snapshot and must not be modified.
+func DialerControllers() []func(network, address string, c syscall.RawConn) error {
+	ControllersLock.Lock()
+	defer ControllersLock.Unlock()
+	return Controllers
 }
 
 type FakePacketConn struct {

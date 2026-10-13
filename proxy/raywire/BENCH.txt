@@ -1,0 +1,183 @@
+raywire/3 measured costs (head tag, PSK), server side only
+
+Command (the official benchmarks in bench_test.go):
+  go test -run xxx -bench 'BenchmarkServerJunkProbe|BenchmarkServerReplayedHead' -benchtime 1s -count 3 ./proxy/raywire/
+Machine: linux/amd64, AMD Ryzen 9 7950X3D, GOMAXPROCS 2 (the -2 suffix in the output).
+The host is shared with other jobs, so the figures move with load. The 1-minute load
+average, from uptime, is given after each block. Blocks taken in different windows
+differ by up to about 2x, so compare only rows measured in the same window.
+
+  Block 1, load 0.38 at the end of the run
+    BenchmarkServerJunkProbe      4760  4499  5023 ns/op
+    BenchmarkServerReplayedHead   1443961  1707325  2431428 ns/op
+  Block 2, load 1.35 at the end of the run
+    BenchmarkServerJunkProbe      7688  8085  8068 ns/op
+    BenchmarkServerReplayedHead   2555819  3174773  3499759 ns/op
+  Block 3, A/B in one window, load 2.43 and 2.59 at the end of the two runs.
+  "Before" is the code of the previous step. "After" is the code of this step.
+    BenchmarkServerJunkProbe      before  6979  7057  7483   after  6944  7018  8074
+    BenchmarkServerReplayedHead   before  2751483  3473164  3645969   after  2551569  2265298  2401816
+
+What the two benchmarks run. The junk probe is one HMAC and the Noise state set-up:
+the server decides at byte 50 on a tag mismatch and reads nothing more. The replayed
+head passes the tag, the length check, the X25519, the canonicalization and Noise,
+and the replay filter refuses it (residual R11).
+
+What changed in this step. Only the removed payload check (handshake.go) lies on
+these benchmark paths, and it is one comparison. The summary timer, the NetConn walk
+in closeAfterDrain and Server.Close are not run by ServerHandshake. So block 3 is a
+noise check: it shows the step did not move the two costs beyond the noise above.
+
+The figures from an earlier scratch harness (about 2.3 us for the junk probe and about
+1.5 ms for a replayed head) came from a harness that is not in the repository. They are
+withdrawn here, because no code in the repository reproduces them.
+
+raywire/2 measured costs (step F4, after the Elligator subgroup fix)
+
+Command:
+  go test -count=1 -run xxx -bench . -benchtime 1s -count 3 ./proxy/raywire/
+Machine: linux/amd64, AMD Ryzen 9 7950X3D, GOMAXPROCS 2 (the -2 suffix in the output).
+Each row is three runs (ns/op). "Before" rows were measured on the same machine in the
+same session, on the code just before the F4 change (server canonicalized the
+ephemeral key before the length check).
+
+Junk probe (server only, out-of-range length word, decided at 34 bytes)
+  BenchmarkServerJunkProbe
+    before  1213110  1328342  1226454 ns/op   (about 1.25 ms)
+    after     94197    96187    95156 ns/op   (about 0.095 ms)
+  The server now runs one Elligator map, one X25519 and one HMAC, and reads nothing
+  past byte 34. The before cost was dominated by the canonicalization of the
+  ephemeral key (BenchmarkCanonicalPoint below). The after figure is not broken
+  down further.
+
+Handshake (default padding: handshake pad 255, frame pad 32)
+  BenchmarkClientHandshake
+    before  2042499  1998154  1981716 ns/op   msg1 233.1 to 238.7 B
+    after   1972973  2004911  2012505 ns/op   msg1 229.4 to 238.0 B
+  BenchmarkServerHandshake
+    before  1985483  1977652  1999308 ns/op
+    after   1960218  1985427  2051888 ns/op
+  The successful path is unchanged within noise. The server still canonicalizes
+  once, after the length check, and the client canonicalizes the responder's key
+  once. Each canonicalization is about 1.1 ms, so it is most of each side's cost.
+  Expected msg1 size is 106 + 127.5 = 233.5 B on average.
+
+  The client benchmark runs the server inside the client's first Write with the
+  timer stopped, so the client figure covers only the client's work. The server
+  benchmark runs the client that produces msg1 with the timer stopped, so the
+  server figure covers only the server's work. Both include the replay check.
+
+  The earlier figure of about 0.74 ms per side was measured before the subgroup
+  fix, so it is not comparable to these numbers.
+
+Canonicalization (BenchmarkCanonicalPoint, one call)
+  1142719  1184330  1313176 ns/op   (about 1.15 ms)
+  This is the cost the server now pays only after the length check passes, and the
+  client pays once for the responder's key.
+
+Frame write (one Write call, steady state, no handshake on the path)
+  mode        size   ns/op (3 runs)            MB/s            wire bytes per call
+  off         1 B    370, 374, 373             2.7             38
+  default     1 B    1779, 1776, 1768          0.56            54
+  bucket256   1 B    541, 517, 514             1.9             290
+  off         64 KiB 51764, 56662, 57585       1266, 1157, 1138  65610
+  default     64 KiB 63159, 62459, 58754       1038, 1049, 1115  65626
+  bucket256   64 KiB 55977, 57944, 55265       1171, 1131, 1186  65859
+
+Notes
+  - Per-frame overhead is 37 bytes in off mode for a 1-byte payload: the 18-byte
+    encrypted header (2-byte length plus tag), the 3-byte body prefix and the 16-byte
+    body tag. Default padding adds 16 bytes on average (uniform 0..32), which gives
+    54 bytes on the wire for 1 byte.
+  - Bucket 256 rounds each frame body to a multiple of 256 bytes, so a 1-byte
+    payload costs 290 bytes on the wire.
+  - Each frame draws its pad length with crypto/rand.Int. The cost of that draw
+    was not measured separately. A buffered source could be tested if the default
+    1-byte case matters.
+  - The subgroup test in elligator_test.go (TestSenderRepresentativesLeaveSubgroup)
+    is not a benchmark, but it is the largest cost in the package's tests. It takes
+    about 13 s without -race and about 70 s with -race.
+
+v3b H3 (step I3): TLS handshake recorder, transport/internet/tls, server side only
+
+Command (the benchmark is BenchmarkTLSServerHandshake in transport/internet/tls/tls_bench_test.go):
+  go test -count=1 -run xxx -bench BenchmarkTLSServerHandshake -benchtime 1s -count 8 ./transport/internet/tls/
+  run twice; each run measures the three modes in turn, so 16 samples per mode.
+Machine: linux/amd64, AMD Ryzen 9 7950X3D, GOMAXPROCS 2 (the -2 suffix). The host is shared, load
+average about 2 during the run. Each op is one server handshake over net.Pipe (TLS 1.3, ECDSA P-256).
+  bare                 crypto/tls alone: median 704 us (min 550, max 888), 834 allocs/op, 118.3 KB/op
+  wrapper-no-recorder  Server with the recorder removed: median 580 us (557, 692), 835 allocs/op, 118.3 KB/op
+  wrapper              Server with the recorder: median 577 us (549, 932), 839 allocs/op, 122.9 KB/op
+
+The recorder's time is not separable from the noise on this host (the medians differ by 3 us, and the
+minima are equal). Its allocation cost is measured and exact: 4 allocs and about 4.6 KB per handshake,
+the growth of the buffer that keeps the bytes read during the handshake. The buffer is released at
+success, so it is not held after the handshake. TestTLSNoAllocAfterHandshake (normal build, not -race)
+gives 0 allocations per 1000 round trips for both bare crypto/tls and the wrapper.
+
+raywire/3b measured costs (H1 seen heads), server side only
+
+Which benchmark each row comes from. SCRATCH marks a benchmark or test that is not in the
+repository. No command in this repository reproduces a SCRATCH row, so it is kept only as a
+record and is not a claim about the repository.
+  BenchmarkServerJunkProbe, BenchmarkServerReplayedHead: official (bench_test.go). Their rows
+    here were measured before the per-client share (raywire/3c has the current code).
+  BenchmarkScratchSeenHead, BenchmarkScratchSeenHead50, BenchmarkScratchVariantHead: SCRATCH.
+  TestScratchMemoryAtCap, TestScratchSeenConcurrentRace: SCRATCH.
+
+Command used for the rows of this block (scratch harness, not in the repository):
+  go test -run xxx -bench 'ScratchSeenHead|ScratchVariantHead|ServerJunkProbe|ServerReplayedHead' -benchtime 1s -count 3 ./proxy/raywire/
+Machine: linux/amd64, AMD Ryzen 9 7950X3D, GOMAXPROCS 2 (the -2 suffix). Load average 2.78
+at the end of the run, shared host, so compare rows within this block only.
+
+  BenchmarkServerJunkProbe        13133  13003  11108 ns/op   (official; 2 HMACs, tag fails at byte 50)
+  BenchmarkServerReplayedHead   1696286 1641882 1692269 ns/op (official; seen memory nil: the v3 replay path)
+  SCRATCH BenchmarkScratchSeenHead       12651  12852  10630 ns/op   (accepted msg1 remembered, full msg1 sent)
+  SCRATCH BenchmarkScratchSeenHead50     10093  10254  10766 ns/op   (the 50-byte head of an accepted msg1)
+  SCRATCH BenchmarkScratchVariantHead   114630 144750 121527 ns/op   (p - r variant of a remembered head: one DH)
+
+  The SCRATCH remembered head costs about the same as the junk head in this block (within 2x:
+  12.6 us against 13.1 us). A variant costs one DH more. The v3 replay path is about 130 times
+  as slow as a remembered head in this block. The variant figure includes the DH and the
+  Elligator decode, and is not split further.
+
+Seen-heads memory at seenHeadCap, before the per-client share (raywire/3b code, one client):
+  TestSeenMemoryAtCap (repository test, measured in this step on the code before the share):
+  7354856 bytes of heap, 7.01 MiB. The earlier 7.05 MiB figure was SCRATCH (TestScratchMemoryAtCap).
+
+Concurrency: SCRATCH TestScratchSeenConcurrentRace (64 goroutines, 2000 operations each, with
+eviction, under -race) passed, with the index sizes and the empty pending set checked at the end.
+
+raywire/3c measured costs (per-client share of the seen memory), server side only
+
+Command (official benchmarks, bench_test.go):
+  go test -run xxx -bench 'BenchmarkServerSeenHead|BenchmarkServerJunkProbe|BenchmarkServerReplayedHead' -benchtime 1s -count 3 ./proxy/raywire/
+Run on 2026-10-10 in a scratch copy of this tree. The copy has the repository code. Its test
+files differ from the repository's: the call sites of Remember and newHeadKeys carry the new
+signatures, and the seen and previous-PSK tests that read removed internals or the old
+validator are left out of the copy. The benchmark code is the repository's. Machine:
+linux/amd64, AMD Ryzen 9 7950X3D,
+GOMAXPROCS 2 (the -2 suffix). Load average 0.90 before the run and 1.07 after it.
+
+  BenchmarkServerSeenHead-2       154410    7673 ns/op   (remembered msg1; the server answers at byte 50)
+  BenchmarkServerSeenHead-2       164887    7705 ns/op
+  BenchmarkServerSeenHead-2       146664    7612 ns/op
+  BenchmarkServerJunkProbe-2      144712    7937 ns/op   (a tag mismatch at byte 50)
+  BenchmarkServerJunkProbe-2      146582    7960 ns/op
+  BenchmarkServerJunkProbe-2      157612    8214 ns/op
+  BenchmarkServerReplayedHead-2      838 1545186 ns/op   (the replay filter refuses it after the Noise run)
+  BenchmarkServerReplayedHead-2      782 2151361 ns/op
+  BenchmarkServerReplayedHead-2      517 2560411 ns/op
+
+  Median of BenchmarkServerSeenHead against median of BenchmarkServerJunkProbe: 7673 and 7960 ns,
+  a ratio of 0.96. The target in the BenchmarkServerSeenHead comment (within 2x) holds.
+
+The 50-byte remembered head: there is no official benchmark for it in bench_test.go.
+BenchmarkServerSeenHead passes the full msg1, and the server still answers at byte 50. The
+SCRATCH BenchmarkScratchSeenHead50 figure (10.1 to 10.8 us, raywire/3b block) is not in the
+repository. A benchmark that passes only the first 50 bytes is not added here, because
+bench_test.go is a test file and its owner (F2) edits it.
+
+Seen-heads memory at seenHeadCap with four clients at their share (65536 heads):
+  SCRATCH TestScratchMemoryFourClientsAtCap, run in the scratch copy: 7874800 bytes, 7.51 MiB.
+  This is within the 8 MiB bound of T-H1-21. The slot is 48 bytes, the 3b slot was 40.

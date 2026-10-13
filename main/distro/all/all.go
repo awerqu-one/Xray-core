@@ -42,6 +42,7 @@ import (
 	_ "github.com/xtls/xray-core/proxy/http"
 	_ "github.com/xtls/xray-core/proxy/loopback"
 	_ "github.com/xtls/xray-core/proxy/masque"
+	_ "github.com/xtls/xray-core/proxy/raywire"
 	_ "github.com/xtls/xray-core/proxy/shadowsocks"
 	_ "github.com/xtls/xray-core/proxy/socks"
 	_ "github.com/xtls/xray-core/proxy/trojan"

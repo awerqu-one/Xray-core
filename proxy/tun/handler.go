@@ -35,6 +35,9 @@ type Handler struct {
 	sniffingRequest session.SniffingRequest
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
+
+	// removeController unregisters the dialer controller of this session.
+	removeController func()
 }
 
 type tunUDPStatsWriter struct {
@@ -117,29 +120,44 @@ func (t *Handler) Start() error {
 		if t.config.AutoOutboundsInterface == "auto" {
 			t.config.AutoOutboundsInterface = ""
 		}
-		updater = &InterfaceUpdater{tunIndex: tunIndex, fixedName: t.config.AutoOutboundsInterface}
-		updater.Update()
-		internet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
-			iface := updater.Get()
+		up := &InterfaceUpdater{tunIndex: tunIndex, fixedName: t.config.AutoOutboundsInterface}
+		updater = up
+		up.Update()
+		remove, err := internet.AddDialerController(func(network, address string, c syscall.RawConn) error {
+			addrPort, _ := netip.ParseAddrPort(address)
+			// skip loopback
+			if addrPort.Addr().IsLoopback() || strings.HasPrefix(strings.ToLower(address), "localhost:") {
+				return nil
+			}
+			iface := up.Get()
 			if iface == nil {
 				errors.LogInfo(context.Background(), "[tun] falied to set interface > iface == nil")
 				return errors.New("iface not found")
 			}
-			return c.Control(func(fd uintptr) {
-				addrPort, _ := netip.ParseAddrPort(address)
-				// skip loopback
-				if addrPort.Addr().IsLoopback() || strings.HasPrefix(strings.ToLower(address), "localhost:") {
-					return
-				}
-				err := setinterface(network, address, fd, iface)
-				if err != nil {
-					errors.LogInfoInner(context.Background(), err, "[tun] falied to set interface")
-				}
-			})
+			var bindErr error
+			if err := c.Control(func(fd uintptr) {
+				bindErr = setinterface(network, address, fd, iface)
+			}); err != nil {
+				return err
+			}
+			if bindErr != nil {
+				errors.LogInfoInner(context.Background(), bindErr, "[tun] falied to set interface")
+			}
+			return bindErr
 		})
+		if err != nil {
+			_ = tunInterface.Close()
+			return err
+		}
+		t.removeController = remove
 	}
-
-	errors.LogInfo(t.ctx, tunName, " created")
+	started := false
+	defer func() {
+		if !started && t.removeController != nil {
+			t.removeController()
+			t.removeController = nil
+		}
+	}()
 
 	tunStackOptions := StackOptions{
 		Tun:         tunInterface,
@@ -180,6 +198,7 @@ func (t *Handler) Start() error {
 	t.stack = tunStack
 	t.tun = tunInterface
 
+	started = true
 	errors.LogInfo(t.ctx, tunName, " up")
 	return nil
 }
@@ -255,6 +274,10 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 // Close implements common.Closable.
 func (t *Handler) Close() error {
+	if t.removeController != nil {
+		t.removeController()
+		t.removeController = nil
+	}
 	return errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
 }
 

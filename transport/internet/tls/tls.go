@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"math/big"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +32,8 @@ var (
 type Conn struct {
 	*tls.Conn
 	suppressCloseNotify atomic.Bool
+	socket              net.Conn    // the connection passed to Client or Server; set once
+	rec                 *recordConn // set once by Server; nil for a client connection
 }
 
 const tlsCloseTimeout = 250 * time.Millisecond
@@ -72,13 +75,164 @@ func (c *Conn) NegotiatedProtocol() string {
 // Client initiates a TLS client handshake on the given connection.
 func Client(c net.Conn, config *tls.Config) net.Conn {
 	tlsConn := tls.Client(c, config)
-	return &Conn{Conn: tlsConn}
+	return &Conn{Conn: tlsConn, socket: c}
 }
 
-// Server initiates a TLS server handshake on the given connection.
+// Server initiates a TLS server handshake on the given connection. The bytes the handshake
+// reads from c are kept until it ends, so that a caller can relay them after a failure (see
+// PreHandshakeRecord).
 func Server(c net.Conn, config *tls.Config) net.Conn {
-	tlsConn := tls.Server(c, config)
-	return &Conn{Conn: tlsConn}
+	rec := &recordConn{Conn: c, started: time.Now()}
+	rec.active.Store(true)
+	return &Conn{Conn: tls.Server(rec, config), socket: c, rec: rec}
+}
+
+// preHandshakeRecordCap is the most bytes a server connection keeps from its socket before its
+// handshake ends. A larger read drops the recording, because a prefix with its beginning
+// missing would not be the prober's stream.
+const preHandshakeRecordCap = 16 * 1024
+
+// recordConn is the socket under the TLS layer of a server connection. While the handshake runs
+// it keeps the bytes read from the socket and whether the TLS layer wrote to it.
+type recordConn struct {
+	net.Conn             // the socket; Read and Write go through it
+	started  time.Time   // accept time: the idle clock of a probe that never sends a byte
+	active   atomic.Bool // true until settle; recording and wrote tracking run only while true
+	wrote    atomic.Bool // set by Write while active: the TLS layer sent bytes before the handshake ended
+	mu       sync.Mutex  // guards overflow, buf, last, failed and taken, and the decision in record and settle
+	overflow bool        // true once more than preHandshakeRecordCap bytes were read
+	buf      []byte      // bytes read while active; nil after success, overflow, or the accessor
+	last     time.Time   // time of the last read that returned bytes while active
+	failed   bool        // set by settle when the handshake ended with an error
+	taken    bool        // set by the first PreHandshakeRecord call that returned ok
+}
+
+// Read reads the socket and records what it returns while active.
+func (r *recordConn) Read(p []byte) (int, error) {
+	n, err := r.Conn.Read(p)
+	if n > 0 && r.active.Load() {
+		r.record(p[:n])
+	}
+	return n, err
+}
+
+// Write records that the TLS layer wrote while active, then writes.
+func (r *recordConn) Write(p []byte) (int, error) {
+	if r.active.Load() {
+		r.wrote.Store(true)
+	}
+	return r.Conn.Write(p)
+}
+
+// record appends b under mu. It checks active under mu, so a read that started before settle
+// cannot append after settle has cleared buf.
+func (r *recordConn) record(b []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.active.Load() {
+		return
+	}
+	r.last = time.Now()
+	if r.overflow {
+		return
+	}
+	if len(r.buf)+len(b) > preHandshakeRecordCap {
+		r.overflow = true
+		r.buf = nil
+		return
+	}
+	r.buf = append(r.buf, b...)
+}
+
+// NetConn returns the socket under the TLS layer, not the recorder, so that UnwrapRawConn and
+// the raywire socket walk reach the TCP connection as they did before recording was added.
+func (c *Conn) NetConn() net.Conn { return c.socket }
+
+// settle ends recording once. It runs after every call that can drive the handshake. A
+// successful handshake drops the recording; a failed one keeps it for PreHandshakeRecord.
+func (c *Conn) settle() {
+	if c.rec == nil || !c.rec.active.Load() {
+		return // a client connection, or the fast path after the first settle
+	}
+	// Read the state before r.mu is taken: ConnectionState waits for the handshake mutex, which
+	// a handshake in another goroutine holds while it waits in record for r.mu.
+	complete := c.Conn.ConnectionState().HandshakeComplete
+	r := c.rec
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.active.Load() {
+		return // another caller settled first
+	}
+	r.active.Store(false)
+	if complete {
+		r.buf = nil
+		r.overflow = false
+	} else {
+		r.failed = true
+	}
+}
+
+// handshakeFirst runs the handshake as a call of its own while recording, so that the recorder
+// never sees application data. After a successful handshake it is one atomic load.
+func (c *Conn) handshakeFirst() error {
+	if c.rec == nil || !c.rec.active.Load() {
+		return nil
+	}
+	err := c.Conn.Handshake()
+	c.settle()
+	return err
+}
+
+func (c *Conn) Read(b []byte) (int, error) {
+	if err := c.handshakeFirst(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *Conn) Write(b []byte) (int, error) {
+	if err := c.handshakeFirst(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *Conn) Handshake() error {
+	err := c.Conn.Handshake()
+	c.settle()
+	return err
+}
+
+func (c *Conn) HandshakeContext(ctx context.Context) error {
+	err := c.Conn.HandshakeContext(ctx)
+	c.settle()
+	return err
+}
+
+// PreHandshakeRecord describes a TLS handshake that failed on this connection. It returns ok = false
+// while the handshake is in progress, after a successful handshake, and on any call after the first
+// one that returned ok = true. When ok is true, prefix holds the bytes read from the socket (nil after
+// an overflow), last is the time of the last read that returned bytes (the accept time if none),
+// socket is the connection under the TLS layer, wrote is true if the TLS layer wrote to the socket
+// before the failure, and overflow is true if more than preHandshakeRecordCap bytes were read.
+// The caller owns prefix.
+func (c *Conn) PreHandshakeRecord() (prefix []byte, last time.Time, socket net.Conn, wrote, overflow, ok bool) {
+	r := c.rec
+	if r == nil {
+		return nil, time.Time{}, nil, false, false, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.active.Load() || !r.failed || r.taken {
+		return nil, time.Time{}, nil, false, false, false
+	}
+	r.taken = true
+	prefix, r.buf = r.buf, nil
+	last = r.last
+	if last.IsZero() {
+		last = r.started
+	}
+	return prefix, last, c.socket, r.wrote.Load(), r.overflow, true
 }
 
 type UConn struct {
