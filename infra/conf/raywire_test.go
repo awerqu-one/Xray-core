@@ -850,7 +850,7 @@ func raywirePSKServer(psk string) string {
 // TestRaywirePSKRequiredClient checks that a client config without a psk is refused
 // with the raywire/3 message. An empty psk counts as missing.
 func TestRaywirePSKRequiredClient(t *testing.T) {
-	const want = `"psk" is not set; raywire/3 requires a pre-shared key`
+	const want = `"psk" is not set; raywire requires a pre-shared key`
 	missing := `{
 		"address": "example.com",
 		"port": 443,
@@ -868,7 +868,7 @@ func TestRaywirePSKRequiredClient(t *testing.T) {
 // TestRaywirePSKRequiredServer checks that a server config without a psk is refused
 // with the raywire/3 message. An empty psk counts as missing.
 func TestRaywirePSKRequiredServer(t *testing.T) {
-	const want = `"psk" is not set; raywire/3 requires a pre-shared key`
+	const want = `"psk" is not set; raywire requires a pre-shared key`
 	missing := `{
 		"privateKey": "` + raywireTestKey(0x01) + `",
 		"clients": [{"publicKey": "` + raywireTestKey(0x02) + `"}],

@@ -208,7 +208,7 @@ func decodeRaywirePSK(value, field string) ([]byte, error) {
 		if field == "previousPsk" {
 			return nil, nil
 		}
-		return nil, errors.New(`raywire: "`, field, `" is not set; raywire/3 requires a pre-shared key`)
+		return nil, errors.New(`raywire: "`, field, `" is not set; raywire requires a pre-shared key`)
 	}
 	for i := 0; i < len(value); i++ {
 		if !isRawURLChar(value[i]) {

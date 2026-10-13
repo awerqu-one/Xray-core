@@ -251,7 +251,7 @@ func probeCases(t *testing.T, srv *Server, clientKey, otherKey noise.DHKey, now 
 		{name: "row 11 unauthorized key, then end", probe: recordMsg1(t, otherKey, serverPublic, now), reasons: []string{"unauthorized"}},
 		{name: "row 12 replay, held", probe: replayB, held: true, reasons: []string{"seen"}, warm: replayB},
 		{name: "row 12 replay, then end", probe: replayA, reasons: []string{"seen"}, warm: replayA},
-		{name: "row 13 stale timestamp, held", probe: recordMsg1(t, clientKey, serverPublic, now.Add(-10*time.Minute)), held: true, reasons: []string{"replay"}},
+		{name: "row 13 timestamp ahead of the skew, held", probe: recordMsg1(t, clientKey, serverPublic, aheadOfSkew(now)), held: true, reasons: []string{"replay"}},
 		// A restart empties the replay cache, so a first message from before the
 		// filter's start is refused. Its timestamp is one second early, which is
 		// inside the skew window, so only the filter's start refuses it.

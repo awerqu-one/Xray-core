@@ -1,23 +1,32 @@
 // Package raywire is a stream transport for the RayBridge fork. It is registered
 // in Xray as the inbound and outbound protocol "raywire".
 //
-// This is raywire/3. A connection starts with a Noise_IK handshake (X25519,
-// ChaCha20-Poly1305, BLAKE2s) under the prologue "raywire/3", so a peer on
+// This is raywire/4. A connection starts with a Noise_IK handshake (X25519,
+// ChaCha20-Poly1305, BLAKE2s) under the prologue "raywire/4", so a peer on
 // another version fails its first message. The client must know the server's
 // static public key and the server's pre-shared key (PSK) in advance. Ephemeral
 // keys travel in Elligator2 form, so the handshake bytes are uniform. msg1 is
 // 122 + P1 bytes and msg2 is 50 + P2 bytes, with random pads up to 512.
 //
 // The first 50 bytes of msg1 are a head: the ephemeral key, a masked length word
-// W1 and a 16-byte tag T. T is a MAC under a key derived from the PSK, over the
-// server's public key, the ephemeral key and W1. The server reads exactly the
-// head and checks T before it does any DH, interprets W1 or waits for another
-// byte. A head with a bad tag is relayed to the decoy at once, as any other
-// invalid first message is. The length word is masked by a key derived from the
-// PSK and the DH secret. The server accepts only the client keys its authorize
-// callback approves, and it rejects a handshake whose ephemeral key it has
-// already accepted. The first message carries the client's clock, so client and
-// server clocks must be within 5 minutes of each other.
+// W1 and a 16-byte tag T. T is a MAC under a key derived from the PSK, over a
+// label, the server's public key, the ephemeral key, W1 and a time bucket: the
+// client's clock in units of 300 seconds (headBucketSeconds), as 8 bytes
+// big-endian. The client takes the bucket from the same clock reading as the
+// timestamp in its Noise payload. The server reads exactly the head and checks T
+// before it does any DH, interprets W1 or waits for another byte. The server reads
+// its clock once. For each of the buckets one before, equal to and one after its
+// own, it computes a tag under psk and under previousPsk, and it compares all six
+// before it uses any result. A head that matches none is relayed to the decoy at
+// once, as any other invalid first message is. The length word is masked by a key
+// derived from the PSK and the DH secret. The server accepts only the client keys
+// its authorize callback approves, and it rejects a handshake whose ephemeral key
+// it has already accepted. The first message carries the client's clock, and the
+// timestamp check allows 5 minutes of skew (maxClockSkew). The tag accepts a client
+// bucket within one bucket of the server's. A clock that is off by more than 5
+// minutes fails the timestamp check (reason "replay"), or fails the tag at byte 50
+// (reason "tag") when its bucket is out of range as well. That can happen from
+// about 5 minutes off, and it always happens from 10 minutes off.
 //
 // A connection that fails the handshake is relayed byte for byte to a decoy,
 // and the server writes nothing of its own before success. A connection that is
@@ -29,13 +38,15 @@
 // A head that the server has accepted within the last 24 hours, or that is still
 // in flight, is refused at byte 50 with the decoy's reaction, as a junk head is.
 // The check is on the wire form R_e before any DH, and again on the DH output, so
-// a variant of a remembered head is refused too (seen.go). The reason is "seen".
-// A head is remembered only after its handshake succeeds, so a stranger cannot
-// fill the memory. A restart clears it.
+// a variant of a remembered head is refused too (seen.go). The reason is "seen"
+// while the head's tag verifies, which is inside its time window (see R2 below).
+// After that window the same head fails the tag. A head is remembered only after
+// its handshake succeeds, so a stranger cannot fill the memory. A restart clears it.
 //
 // The server accepts a head under psk, and during a rotation also under
-// previousPsk until its expiry (keys.go). Both tags are always computed, so a head
-// that matches neither costs the same as one that matches either.
+// previousPsk until its expiry (keys.go). All six candidate tags are always
+// computed, and previousPsk has a random stand-in key when it is not set (keys.go).
+// So a head that matches none costs the same as one that matches one.
 //
 // TCP and UDP are supported. UDP is carried over the stream as length-prefixed
 // datagrams, so it is subject to head-of-line blocking.
@@ -59,7 +70,7 @@
 // is not shown. WebSocket, HTTP upgrade, gRPC, XHTTP, MASQUE and header
 // camouflage above TLS do not relay (see the operator's transport choice).
 //
-// Residual risks that raywire/3 does not fix:
+// Residual risks that raywire/4 does not fix:
 //   - Raw-TCP entropy: every byte of the first packet is uniform, and every frame
 //     is ciphertext. Only the outer layer hides this.
 //   - Silent short probes: a silent probe of 1 to 49 bytes that is not a prefix
@@ -68,11 +79,19 @@
 //     out of scope. The probe needs no key.
 //   - Head replay (R2): a captured head that the server never accepted, because
 //     authorize refused it, its timestamp was out of range or its Noise check
-//     failed, is answered with the 10 s stall, and it keeps being answered that way
-//     for as long as the server runs. Its tag covers R_e and W1 and has no time.
-//     A head accepted within 24 hours and still in memory is answered at byte 50.
-//     The memory holds 65536 heads at most. A busy server evicts a head before its
-//     24 hours when the memory is full, and a restart clears the memory.
+//     failed, passes the tag while the server's clock is inside the head's window,
+//     and is then answered with the 10 s stall. The window is three buckets of the
+//     server's clock, 900 seconds. With synchronized clocks, a head made at client
+//     time t is accepted until the end of the server bucket after the client's own
+//     bucket, which is 300 to 600 seconds after t. After that the head is a junk
+//     head: it fails the tag at byte 50, with six HMACs and no DH. A head accepted
+//     within 24 hours and still in memory is answered at byte 50. The memory holds
+//     65536 heads at most. A busy server evicts a head before its 24 hours when the
+//     memory is full. A restart clears the memory, so a head accepted before a
+//     restart stalls again until its window closes.
+//   - Time bucket: the bucket is not sent on the wire, the tag covers it. A prober
+//     that has the PSK and the server's public key can compute the tag for any
+//     bucket, so the tag does not hide the head from a PSK holder.
 //   - Seen-memory share (R2a): one client holds at most a quarter of the memory
 //     (16384 heads). At its share, a new head of the client replaces its own oldest
 //     head, so one client cannot push out another. The heads of a client below its
@@ -87,9 +106,9 @@
 //     key, whether each length word is in range. Only a head that is neither
 //     remembered nor in flight reaches this check. A remembered head and its
 //     variants are answered at byte 50 before the length word is read.
-//   - Replayed msg1 CPU (R11): a head that was never accepted costs one DH and one
-//     Noise run before the replay filter refuses it. A remembered head costs two
-//     HMACs and a map lookup. A PSK holder can make a variant of a remembered head,
+//   - Replayed msg1 CPU (R11): a head that was never accepted and is inside its
+//     window costs one DH and one Noise run before the replay filter refuses it. A
+//     remembered head costs six HMACs and a map lookup. A PSK holder can make a variant of a remembered head,
 //     which costs one DH. The per-source caps bound concurrency, not this CPU.
 //   - Shared PSK: every client of an inbound holds the same PSK, so a leaked client
 //     configuration leaks it. A rotation keeps the old PSK accepted until
@@ -113,10 +132,17 @@
 //   - Drain limits: queued bytes beyond 256 KiB, and bytes that arrive after the
 //     drain, still reset the connection. Platforms without the Unix drain close
 //     without it.
-//   - Version break: every raywire/2 client fails its first message and is treated
-//     as a probe. There is no compatibility mode.
+//   - Clock: the time bucket does not widen the clock tolerance. The timestamp
+//     check still allows 5 minutes (maxClockSkew), and a client off by more than
+//     that cannot connect. Operators should keep their clocks on NTP.
+//   - Version break: every raywire/2 and raywire/3 client fails its first message
+//     and is treated as a probe. A raywire/3 head fails the tag at byte 50, since
+//     its tag has no bucket. There is no compatibility mode, and client and server
+//     are updated together. The labels prkLabel and fingerprintLabel keep the text
+//     "raywire/3", so the PSKs, links and fingerprints made for raywire/3 stay valid.
 //
-// Measured costs are in BENCH.txt in this directory.
+// Measured costs are in BENCH.txt in this directory. They were measured on
+// raywire/3, before the six-tag head check.
 package raywire
 
 import (
@@ -139,18 +165,25 @@ import (
 const (
 	// prologue binds the handshake to this protocol version. A peer on another
 	// version derives other keys, so its first message fails.
-	prologue = "raywire/3"
+	prologue = "raywire/4"
 
 	// The labels below separate the PSK-derived keys and MACs. Every key except
 	// the extraction key is derived from prk, which is the PSK's extraction, so
 	// the PSK itself keys one HMAC only.
 	prkLabel         = "raywire/3 psk"
-	headKeyLabel     = "raywire/3 head key"
-	maskKeyLabel     = "raywire/3 w1"
-	tagLabel         = "raywire/3 head"
+	headKeyLabel     = "raywire/4 head key"
+	maskKeyLabel     = "raywire/4 w1"
+	tagLabel         = "raywire/4 head"
 	fingerprintLabel = "raywire/3 fingerprint"
 
 	handshakeTimeout = 10 * time.Second
+
+	// headBucketSeconds is the width of the time bucket that the head tag covers.
+	// The client tags its head with the bucket of its own clock. The server accepts
+	// the bucket of its clock and the two next to it, so a head is valid for at most
+	// 3 * headBucketSeconds, and a skew of at most one bucket (the timestamp check allows
+	// 5 minutes) is always inside it.
+	headBucketSeconds = 300
 
 	// timestampSize is the length of the timestamp that opens msg1: the
 	// client's clock in nanoseconds, big-endian.
@@ -308,7 +341,8 @@ func ClientHandshake(conn net.Conn, static noise.DHKey, serverPublic []byte, key
 	// clock window has passed.
 	p1 := uniformInt(pol.Handshake)
 	payload1 := make([]byte, timestampSize+p1)
-	binary.BigEndian.PutUint64(payload1, uint64(handshakeClock().UnixNano()))
+	clientNow := handshakeClock()
+	binary.BigEndian.PutUint64(payload1, uint64(clientNow.UnixNano()))
 	out, _, _, err := hs.WriteMessage(nil, payload1)
 	if err != nil {
 		return nil, err
@@ -328,7 +362,7 @@ func ClientHandshake(conn net.Conn, static noise.DHKey, serverPublic []byte, key
 	// secret. T binds the head to this server, to R and to W1, so the server
 	// rejects a head it did not expect before it reads W1.
 	w1 := binary.BigEndian.AppendUint16(nil, uint16(n1)^lengthMask(keys.maskKey, dh))
-	tag := headTag(keys.headKey, serverPublic, R, w1)
+	tag := headTag(keys.headKey, serverPublic, R, w1, headBucket(clientNow))
 	msg1 := make([]byte, 0, hsHeadLen+n1)
 	msg1 = append(msg1, R...)
 	msg1 = append(msg1, w1...)
@@ -430,8 +464,8 @@ func serverHandshake(conn net.Conn, static noise.DHKey, authorize func(clientPub
 		return nil, err
 	}
 	// The rest of the head is read in one go. The tag is checked before W1 is
-	// used or any further byte is awaited, so a head without the PSK costs one
-	// HMAC and no key work.
+	// used or any further byte is awaited, so a head without the PSK costs six
+	// HMACs (matchHeadTag) and no key work.
 	if err := r.read(hsHeadLen - hsKeyLen); err != nil {
 		return nil, err
 	}
@@ -439,14 +473,11 @@ func serverHandshake(conn net.Conn, static noise.DHKey, authorize func(clientPub
 	w1 := r.buf[hsKeyLen : hsKeyLen+2]
 	tag := r.buf[hsKeyLen+2 : hsHeadLen]
 
-	// Both candidate tags are computed before either is compared. A head that verifies
+	// All six candidate tags (three buckets for psk, three for previousPsk) are computed before any is compared. A head that verifies
 	// under psk therefore costs the same as one that verifies under previousPsk, and the
 	// same as one that verifies under neither.
-	expectCur := headTag(keys.cur.headKey, static.Public, re, w1)
-	expectPrev := headTag(keys.prev.headKey, static.Public, re, w1)
-	okCur := hmac.Equal(expectCur, tag)
-	okPrev := hmac.Equal(expectPrev, tag)
 	now := handshakeClock()
+	okCur, okPrev := matchHeadTag(keys, static.Public, re, w1, tag, now)
 	okPrev = okPrev && keys.hasPrev && now.Before(keys.prevUntil)
 	if !okCur && !okPrev {
 		return nil, r.fail("tag", ErrTag)
@@ -661,14 +692,37 @@ func hasPrefix4(b []byte) bool {
 // headTag returns T, the tag over the label, the server's public key, R_e and
 // W1, keyed with the PSK-derived head key. Both sides use the server's public
 // key, so a head made for another server does not verify.
-func headTag(headKey, serverPub, re, w1 []byte) []byte {
+func headTag(headKey, serverPub, re, w1 []byte, bucket uint64) []byte {
 	headTagCalls()
 	mac := hmac.New(sha256.New, headKey)
 	mac.Write([]byte(tagLabel))
 	mac.Write(serverPub)
 	mac.Write(re)
 	mac.Write(w1)
+	mac.Write(binary.BigEndian.AppendUint64(nil, bucket))
 	return mac.Sum(nil)[:headTagLen]
+}
+
+// headBucket returns the time bucket of t: its Unix seconds divided by
+// headBucketSeconds.
+func headBucket(t time.Time) uint64 {
+	return uint64(t.Unix()) / headBucketSeconds
+}
+
+// matchHeadTag reports whether tag verifies under the current key and under the
+// previous key, for the bucket of now and the one on each side. Every candidate is
+// computed and compared before any result is used, so a head that verifies under
+// psk costs the same as one that verifies under previousPsk or under neither, and
+// no bucket is told from another by timing.
+func matchHeadTag(keys headKeys, serverPub, re, w1, tag []byte, now time.Time) (okCur, okPrev bool) {
+	b := headBucket(now)
+	for _, bucket := range [3]uint64{b - 1, b, b + 1} {
+		curOK := hmac.Equal(headTag(keys.cur.headKey, serverPub, re, w1, bucket), tag)
+		prevOK := hmac.Equal(headTag(keys.prev.headKey, serverPub, re, w1, bucket), tag)
+		okCur = okCur || curOK
+		okPrev = okPrev || prevOK
+	}
+	return okCur, okPrev
 }
 
 // lengthMask returns the 16-bit mask of the length word. It is keyed by the

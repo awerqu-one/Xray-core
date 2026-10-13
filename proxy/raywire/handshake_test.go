@@ -20,7 +20,7 @@ import (
 	mrand "math/rand/v2"
 )
 
-var update = flag.Bool("update", false, "rewrite testdata/handshake_v3.golden from the current output")
+var update = flag.Bool("update", false, "rewrite testdata/handshake_v4.golden from the current output")
 
 // runHandshake runs both sides of the handshake over the two ends of a pipe, with the
 // PSK-derived keys of testPSK on both sides. The client pins serverPublic, which is the
@@ -266,7 +266,7 @@ func TestHandshakeGoldenVector(t *testing.T) {
 	msg1, msg2 := captureHandshake(t, clientKey, serverKey, defaultPadPolicy())
 	got := fmt.Sprintf("msg1 %x\nmsg2 %x\n", msg1, msg2)
 
-	const path = "testdata/handshake_v3.golden"
+	const path = "testdata/handshake_v4.golden"
 	if *update {
 		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
 			t.Fatal(err)
@@ -284,7 +284,8 @@ func TestHandshakeGoldenVector(t *testing.T) {
 // TestGoldenVectorIsSpecFormula checks the golden msg1 against section 5, so that the
 // golden file cannot pin bytes that the spec does not give.
 func TestGoldenVectorIsSpecFormula(t *testing.T) {
-	raw, err := os.ReadFile("testdata/handshake_v3.golden")
+	fixRandomness(t)
+	raw, err := os.ReadFile("testdata/handshake_v4.golden")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,12 +586,58 @@ func TestHandshakeDecisions(t *testing.T) {
 		expectSentinel(t, sc)
 	})
 
-	t.Run("skewed timestamp", func(t *testing.T) {
-		// Capture with a client clock ten minutes behind, then restore the clock
-		// for the server.
+	t.Run("tag bucket window", func(t *testing.T) {
+		// The server's clock is testNow, the start of a bucket. A head is tagged with
+		// the bucket of the client's clock, and the server accepts that bucket and one
+		// on each side. A head from further away fails at byte 50, as a junk head does,
+		// and so a captured head has no stall once its window has passed.
 		savedClock := handshakeClock
 		t.Cleanup(func() { handshakeClock = savedClock })
-		handshakeClock = func() time.Time { return time.Now().Add(-10 * time.Minute) }
+		for _, tc := range []struct {
+			name   string
+			offset time.Duration
+			reason string
+		}{
+			// The client is refused by authorize, which comes after the tag, so the
+			// reason shows that the tag verified.
+			{"previous bucket", -299 * time.Second, "unauthorized"},
+			{"next bucket, timestamp too far", 2*headBucketSeconds*time.Second - time.Second, "replay"},
+			{"two buckets ahead", 2 * headBucketSeconds * time.Second, "tag"},
+			{"two buckets behind", -301 * time.Second, "tag"},
+			{"ten minutes behind", -10 * time.Minute, "tag"},
+			{"a day behind", -24 * time.Hour, "tag"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				handshakeClock = func() time.Time { return testNow.Add(tc.offset) }
+				head, _ := captureHandshake(t, clientKey, serverKey, defaultPadPolicy())
+				handshakeClock = func() time.Time { return testNow }
+				auth := allowAll
+				if tc.reason == "unauthorized" {
+					auth = func([]byte) bool { return false }
+				}
+				he, _ := decide(t, serverKey, auth, NewReplayFilter(), sendThenSentinel(head))
+				got := ""
+				if he != nil {
+					got = he.Reason
+				}
+				if got != tc.reason {
+					t.Fatalf("reason %q, want %q", got, tc.reason)
+				}
+				if tc.reason == "tag" && len(he.Consumed) != hsHeadLen {
+					t.Fatalf("%d bytes consumed, want the %d of the head", len(he.Consumed), hsHeadLen)
+				}
+			})
+		}
+	})
+
+	t.Run("skewed timestamp", func(t *testing.T) {
+		// Capture with a client clock just over the allowed skew ahead, so the head
+		// is in the next bucket and its tag verifies, then restore the clock for
+		// the server.
+		savedClock := handshakeClock
+		t.Cleanup(func() { handshakeClock = savedClock })
+		ahead := aheadOfSkew(time.Now())
+		handshakeClock = func() time.Time { return ahead }
 		skewed, _ := captureHandshake(t, clientKey, serverKey, defaultPadPolicy())
 		handshakeClock = savedClock
 
@@ -727,7 +774,7 @@ func retagged(t *testing.T, msg1 []byte, serverKey noise.DHKey, wire []byte) []b
 	W1 := msg1[hsKeyLen : hsKeyLen+2]
 	out := append([]byte(nil), wire...)
 	out = append(out, W1...)
-	out = append(out, refTag(refHeadKey(testPSK), serverKey.Public, wire, W1)...)
+	out = append(out, refTag(refHeadKey(testPSK), serverKey.Public, wire, W1, testBucket())...)
 	return append(out, msg1[hsHeadLen:]...)
 }
 

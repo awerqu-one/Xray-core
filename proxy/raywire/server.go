@@ -221,7 +221,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
 	now := handshakeClock()
 	fp := hex.EncodeToString(keys.cur.fingerprint)
-	errors.LogInfo(ctx, "raywire: version raywire/3, psk fingerprint ", fp)
+	errors.LogInfo(ctx, "raywire: version raywire/4, psk fingerprint ", fp)
 	s := &Server{
 		privateKey:       key,
 		keys:             keys,
@@ -336,7 +336,7 @@ func (s *Server) handlePreAuth(ctx context.Context, conn stat.Connection, pol pa
 	}
 	errors.LogDebug(ctx, "raywire: ", he.Reason, " from ", conn.RemoteAddr(), " after ", len(he.Consumed), " bytes")
 	switch he.Reason {
-	case "tag", "length", "noise":
+	case "tag", "length", "noise", "replay":
 		s.headFails.add()
 	}
 	// A peer that closed without sending a byte gets no decoy, since the decoy

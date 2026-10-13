@@ -268,8 +268,8 @@ func TestPreviousPSKSameWork(t *testing.T) {
 			if conn != nil {
 				conn.Close()
 			}
-			if c.tag != 2 {
-				t.Fatalf("%d head tags for one head, want 2", c.tag)
+			if c.tag != 6 {
+				t.Fatalf("%d head tags for one head, want 6", c.tag)
 			}
 		})
 	}
@@ -664,7 +664,7 @@ func TestV3ServerConfigUnchanged(t *testing.T) {
 	}
 	t.Cleanup(func() { srv.Close() })
 
-	want := "raywire: version raywire/3, psk fingerprint " + fingerprintHex(testPSK)
+	want := "raywire: version raywire/4, psk fingerprint " + fingerprintHex(testPSK)
 	if n := len(lineWith(logs, want)); n != 1 {
 		t.Fatalf("%d v3 start lines, want 1: %q", n, logs.lines())
 	}

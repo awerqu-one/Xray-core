@@ -1,3 +1,12 @@
+Note on raywire/4. The figures in this file were measured on raywire/3 and have not
+been measured again for raywire/4. raywire/4 changes the head check: the server
+computes six head tags before any DH (matchHeadTag in handshake.go: three buckets,
+for psk and for previousPsk), where raywire/3 computed two. The junk probe and the
+replayed head therefore do more HMAC work in raywire/4 than the rows below show. The
+raywire/3b block says that its junk probe row is 2 HMACs, and the first block says one.
+Compare raywire/4 figures only with rows from a run in the same window, and state the
+version and the load average with each row.
+
 raywire/3 measured costs (head tag, PSK), server side only
 
 Command (the official benchmarks in bench_test.go):
@@ -18,7 +27,7 @@ differ by up to about 2x, so compare only rows measured in the same window.
     BenchmarkServerJunkProbe      before  6979  7057  7483   after  6944  7018  8074
     BenchmarkServerReplayedHead   before  2751483  3473164  3645969   after  2551569  2265298  2401816
 
-What the two benchmarks run. The junk probe is one HMAC and the Noise state set-up:
+What the two benchmarks run. The junk probe is two HMACs (psk and previousPsk; six in raywire/4) and the Noise state set-up:
 the server decides at byte 50 on a tag mismatch and reads nothing more. The replayed
 head passes the tag, the length check, the X25519, the canonicalization and Noise,
 and the replay filter refuses it (residual R11).

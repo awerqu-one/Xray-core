@@ -120,7 +120,7 @@ func checkAccepted(t *testing.T, input []byte, conn *memConn, serverKey noise.DH
 		t.Fatalf("accepted after %d bytes, outside the msg1 range", conn.n)
 	}
 	R, W1, T := input[:hsKeyLen], input[hsKeyLen:hsKeyLen+2], input[hsKeyLen+2:hsHeadLen]
-	if !bytes.Equal(T, refTag(refHeadKey(testPSK), serverKey.Public, R, W1)) {
+	if !bytes.Equal(T, refTag(refHeadKey(testPSK), serverKey.Public, R, W1, testBucket())) {
 		t.Fatal("accepted a head tag that the PSK does not give")
 	}
 	uc := canonicalDecode(R)

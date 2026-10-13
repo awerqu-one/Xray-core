@@ -55,9 +55,9 @@ func refHMAC(key []byte, parts ...[]byte) []byte {
 
 func refPRK(psk []byte) []byte { return refHMAC(psk, []byte("raywire/3 psk")) }
 
-func refHeadKey(psk []byte) []byte { return refHMAC(refPRK(psk), []byte("raywire/3 head key")) }
+func refHeadKey(psk []byte) []byte { return refHMAC(refPRK(psk), []byte("raywire/4 head key")) }
 
-func refMaskKey(psk []byte) []byte { return refHMAC(refPRK(psk), []byte("raywire/3 w1")) }
+func refMaskKey(psk []byte) []byte { return refHMAC(refPRK(psk), []byte("raywire/4 w1")) }
 
 func refFingerprint(psk []byte) []byte {
 	return refHMAC(refPRK(psk), []byte("raywire/3 fingerprint"))[:4]
@@ -69,10 +69,13 @@ func refMaskWord(maskKey, dh []byte) uint16 {
 }
 
 // refTag is T of section 5: the leading 16 bytes of the tag over the label, the
-// server public key, R_e and W1.
-func refTag(headKey, serverPub, R, W1 []byte) []byte {
-	return refHMAC(headKey, []byte("raywire/3 head"), serverPub, R, W1)[:16]
+// server public key, R_e, W1 and the time bucket.
+func refTag(headKey, serverPub, R, W1 []byte, bucket uint64) []byte {
+	return refHMAC(headKey, []byte("raywire/4 head"), serverPub, R, W1, binary.BigEndian.AppendUint64(nil, bucket))[:16]
 }
+
+// testBucket is the time bucket of the test clock.
+func testBucket() uint64 { return headBucket(handshakeClock()) }
 
 // refDH is the server's DH secret for the wire form R, computed from the raw point of
 // R as section 5 gives it.
@@ -91,7 +94,7 @@ func rawHead(psk, serverPub, R, W1 []byte) []byte {
 	head := make([]byte, 0, hsHeadLen)
 	head = append(head, R...)
 	head = append(head, W1...)
-	return append(head, refTag(refHeadKey(psk), serverPub, R, W1)...)
+	return append(head, refTag(refHeadKey(psk), serverPub, R, W1, testBucket())...)
 }
 
 // headWithLength returns the head of a msg1 whose remainder is n1 bytes. It is built
@@ -110,7 +113,7 @@ func headWithLength(t testing.TB, serverKey noise.DHKey, psk, R []byte, n1 int) 
 func checkHeadFormulas(t testing.TB, msg1 []byte, serverKey noise.DHKey, psk []byte) int {
 	t.Helper()
 	R, W1, T := msg1[:hsKeyLen], msg1[hsKeyLen:hsKeyLen+2], msg1[hsKeyLen+2:hsHeadLen]
-	if !bytes.Equal(T, refTag(refHeadKey(psk), serverKey.Public, R, W1)) {
+	if !bytes.Equal(T, refTag(refHeadKey(psk), serverKey.Public, R, W1, testBucket())) {
 		t.Fatalf("tag %x does not match section 5", T)
 	}
 	n1 := int(binary.BigEndian.Uint16(W1) ^ refMaskWord(refMaskKey(psk), refDH(t, serverKey.Private, R)))
@@ -288,15 +291,15 @@ func TestTagFormula(t *testing.T) {
 		for range 4 {
 			msg1, _ := captureHandshake(t, clientKey, serverKey, padPolicy{Handshake: p})
 			R, W1, T := msg1[:hsKeyLen], msg1[hsKeyLen:hsKeyLen+2], msg1[hsKeyLen+2:hsHeadLen]
-			if want := refTag(refHeadKey(testPSK), serverKey.Public, R, W1); !bytes.Equal(T, want) {
+			if want := refTag(refHeadKey(testPSK), serverKey.Public, R, W1, testBucket()); !bytes.Equal(T, want) {
 				t.Fatalf("P=%d: T = %x, spec gives %x", p, T, want)
 			}
-			if got := headTag(testKeys().headKey, serverKey.Public, R, W1); !bytes.Equal(got, T) {
+			if got := headTag(testKeys().headKey, serverKey.Public, R, W1, testBucket()); !bytes.Equal(got, T) {
 				t.Fatalf("P=%d: package tag %x, wire %x", p, got, T)
 			}
 			// T covers the server's public key, so the same head fails for another server.
 			other := newKey(t)
-			if bytes.Equal(T, refTag(refHeadKey(testPSK), other.Public, R, W1)) {
+			if bytes.Equal(T, refTag(refHeadKey(testPSK), other.Public, R, W1, testBucket())) {
 				t.Fatal("the tag does not depend on the server public key")
 			}
 		}
@@ -321,27 +324,28 @@ func TestKnownAnswerMACs(t *testing.T) {
 	prk := refPRK(psk)
 	check("prk", prk, "427945472d52a856172754e4058e12f6339dc5bac3055b09f9e1ad4f3175507e")
 	keyHead := refHeadKey(psk)
-	check("keyHead", keyHead, "e7cef805025692a62e6fe4c903c6e7a5b578682be3218b8e9dee691d8178d853")
+	check("keyHead", keyHead, "2afac5177f332c6dc4cb82dcc2ddcded2da58013a6dbba056bf4342d8571fda9")
 	keyMask := refMaskKey(psk)
-	check("keyMask", keyMask, "897ab99106b6d7f8b443956f4d911a1b44532db8afd3bebc6d1b159242ab4c90")
+	check("keyMask", keyMask, "78eb39892114136d900a6ea461136d68d70f0d830720a8fa7befc7026f37981d")
 	mw := refMaskWord(keyMask, dh)
-	if mw != 0x6095 {
-		t.Fatalf("maskWord = %04x, want 6095", mw)
+	if mw != 0x9ab4 {
+		t.Fatalf("maskWord = %04x, want 9ab4", mw)
 	}
 	W1 := binary.BigEndian.AppendUint16(nil, n1^mw)
-	check("W1", W1, "61d2")
-	check("T", refTag(keyHead, S, R, W1), "94d12451162cd627a7ab49c4b0357704")
+	check("W1", W1, "9bf3")
+	const katBucket = 5900000
+	check("T", refTag(keyHead, S, R, W1, katBucket), "ab703ca35203d3cfcc8199c62b811ec8")
 	check("fingerprint", refFingerprint(psk), "9ec92444")
 
 	// The package holds the same values, and its mask and tag agree with them.
 	keys := derivePSKKeys(psk)
-	check("package headKey", keys.headKey, "e7cef805025692a62e6fe4c903c6e7a5b578682be3218b8e9dee691d8178d853")
-	check("package maskKey", keys.maskKey, "897ab99106b6d7f8b443956f4d911a1b44532db8afd3bebc6d1b159242ab4c90")
+	check("package headKey", keys.headKey, "2afac5177f332c6dc4cb82dcc2ddcded2da58013a6dbba056bf4342d8571fda9")
+	check("package maskKey", keys.maskKey, "78eb39892114136d900a6ea461136d68d70f0d830720a8fa7befc7026f37981d")
 	check("package fingerprint", keys.fingerprint, "9ec92444")
 	if got := lengthMask(keys.maskKey, dh); got != mw {
 		t.Fatalf("package mask = %04x, want %04x", got, mw)
 	}
-	if got := headTag(keys.headKey, S, R, W1); !bytes.Equal(got, refTag(keyHead, S, R, W1)) {
+	if got := headTag(keys.headKey, S, R, W1, katBucket); !bytes.Equal(got, refTag(keyHead, S, R, W1, katBucket)) {
 		t.Fatalf("package tag = %x", got)
 	}
 	if got := int(binary.BigEndian.Uint16(W1) ^ lengthMask(keys.maskKey, dh)); got != n1 {
@@ -491,7 +495,7 @@ func TestSHolderWithoutPSKNoStall(t *testing.T) {
 		t.Fatal(err)
 	}
 	unkeyed := hmac.New(sha256.New, dh)
-	unkeyed.Write([]byte("raywire/3 w1"))
+	unkeyed.Write([]byte("raywire/4 w1"))
 	unkeyedMask := binary.BigEndian.Uint16(unkeyed.Sum(nil))
 
 	allowAll := func([]byte) bool { return true }
@@ -707,17 +711,45 @@ func TestNoKeyWorkBeforeTagAST(t *testing.T) {
 		t.Fatal("serverHandshake is not in handshake.go")
 	}
 
-	// The tag check is the first call to hmac.Equal in the function.
+	// The tag check is the first call to matchHeadTag in the function. matchHeadTag
+	// holds the hmac.Equal calls, and its own body is checked below.
 	tagPos := token.NoPos
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if ok && calleeName(call) == "Equal" && (tagPos == token.NoPos || call.Pos() < tagPos) {
+		if ok && calleeName(call) == "matchHeadTag" && (tagPos == token.NoPos || call.Pos() < tagPos) {
 			tagPos = call.Pos()
 		}
 		return true
 	})
 	if tagPos == token.NoPos {
-		t.Fatal("no tag check (hmac.Equal) in serverHandshake")
+		t.Fatal("no tag check (matchHeadTag) in serverHandshake")
+	}
+	var match *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "matchHeadTag" {
+			match = fd
+		}
+	}
+	if match == nil {
+		t.Fatal("matchHeadTag is not in handshake.go")
+	}
+	sawEqual := false
+	ast.Inspect(match.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch name := calleeName(call); name {
+		case "Equal":
+			sawEqual = true
+		case "headTag", "headBucket":
+		default:
+			t.Errorf("matchHeadTag calls %s at %v, but it may only compute and compare tags", name, fset.Position(call.Pos()))
+		}
+		return true
+	})
+	if !sawEqual {
+		t.Fatal("matchHeadTag compares no tag")
 	}
 
 	// cheap lists the calls that may run before the tag check. None of them does a DH,
@@ -725,6 +757,7 @@ func TestNoKeyWorkBeforeTagAST(t *testing.T) {
 	cheap := map[string]bool{
 		"NewHandshakeState": true, // builds the Noise state, no key work
 		"Now":               true, // clock
+		"handshakeClock":    true, // clock, read for the tag bucket
 		"Add":               true, // deadline arithmetic
 		"SetDeadline":       true, // conn.SetDeadline, set and cleared around the handshake
 		"read":              true, // preAuthReader: reads only

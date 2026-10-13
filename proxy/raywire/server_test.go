@@ -233,7 +233,7 @@ func TestProbesReachDecoyLikeDirectConnection(t *testing.T) {
 		{"Noise failure", forgedMsg1(t, srv.privateKey, 72), "noise"},
 		{"wrong server key", recordMsg1(t, clientKey, otherKey.Public, now), ""},
 		{"unauthorized key", recordMsg1(t, otherKey, srv.privateKey.Public, now), "unauthorized"},
-		{"stale timestamp", recordMsg1(t, clientKey, srv.privateKey.Public, now.Add(-10*time.Minute)), "replay"},
+		{"timestamp ahead of the skew", recordMsg1(t, clientKey, srv.privateKey.Public, aheadOfSkew(now)), "replay"},
 	}
 	for _, p := range probes {
 		t.Run(p.name, func(t *testing.T) {
@@ -874,4 +874,14 @@ func TestNewServerNilPaddingUsesDefaults(t *testing.T) {
 	if s.pad != defaultPadPolicy() {
 		t.Fatalf("pad = %+v, want the defaults %+v", s.pad, defaultPadPolicy())
 	}
+}
+
+// aheadOfSkew returns a client clock reading that is more than maxClockSkew ahead of
+// now and in the bucket after the server's. A head made at that time has a tag that
+// verifies, and its timestamp is refused after authorize. The reading is the end of
+// the next bucket less a millisecond, so the margin over maxClockSkew is the rest of
+// the server's bucket, and a slow test does not move it under maxClockSkew.
+func aheadOfSkew(now time.Time) time.Time {
+	start := now.Truncate(headBucketSeconds * time.Second)
+	return start.Add(2*headBucketSeconds*time.Second - time.Millisecond)
 }

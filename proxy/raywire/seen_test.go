@@ -681,7 +681,7 @@ func TestSeenHeadNotRememberedBeforeSuccess(t *testing.T) {
 			build: func(srv *Server) []byte { return recordMsg1(t, clientKey, srv.privateKey.Public, now) }},
 		{name: "timestamp out of skew", wantFirst: "replay", clientAllowed: true,
 			build: func(srv *Server) []byte {
-				return recordMsg1(t, clientKey, srv.privateKey.Public, now.Add(-10*time.Minute))
+				return recordMsg1(t, clientKey, srv.privateKey.Public, aheadOfSkew(now))
 			}},
 		{name: "Noise payload corrupted behind a valid tag", wantFirst: "noise", clientAllowed: true,
 			build: func(srv *Server) []byte {
@@ -882,7 +882,7 @@ func TestSeenPendingReleasedOnEveryExit(t *testing.T) {
 			authorize: authorize, wantFirst: "noise", wantSecond: "noise"},
 		{name: "unauthorized", probe: recordMsg1(t, otherKey, serverKey.Public, now), drop: false,
 			authorize: authorize, wantFirst: "unauthorized", wantSecond: "unauthorized"},
-		{name: "replay", probe: recordMsg1(t, clientKey, serverKey.Public, now.Add(-10*time.Minute)), drop: false,
+		{name: "replay", probe: recordMsg1(t, clientKey, serverKey.Public, aheadOfSkew(now)), drop: false,
 			authorize: authorize, wantFirst: "replay", wantSecond: "replay"},
 		{name: "ephemeral", probe: torsionHead(t, serverKey), drop: false,
 			authorize: authorize, wantFirst: "ephemeral", wantSecond: "ephemeral"},
@@ -1062,7 +1062,7 @@ func TestVariantTorsionShiftAnsweredAtByte50(t *testing.T) {
 func headCopyUnder(msg1, serverPub, headKey, re, w1 []byte) []byte {
 	out := append([]byte(nil), re...)
 	out = append(out, w1...)
-	out = append(out, refTag(headKey, serverPub, re, w1)...)
+	out = append(out, refTag(headKey, serverPub, re, w1, testBucket())...)
 	return append(out, msg1[hsHeadLen:]...)
 }
 
