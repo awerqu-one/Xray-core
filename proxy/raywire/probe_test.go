@@ -458,13 +458,11 @@ func TestRefusedProbesSendNothing(t *testing.T) {
 	})
 
 	t.Run("row 18 relay pool full", func(t *testing.T) {
-		oldAdm := relayAdm
-		relayAdm = newAdmission(1, maxRelaysPerIP)
-		t.Cleanup(func() { relayAdm = oldAdm })
-		if _, ok := relayAdm.TryAcquire("127.0.0.1"); !ok {
+		srv := newProbeServer(t, decoy)
+		srv.relay = newAdmission(1, maxRelaysPerIP)
+		if _, ok := srv.relay.TryAcquire("127.0.0.1"); !ok {
 			t.Fatal("new relay pool has no free slot")
 		}
-		srv := newProbeServer(t, decoy)
 		dials := countDials(t, errors.New("unexpected dial"))
 
 		checkDecision(t, refuseProbe(t, srv, probe), []string{"prefix"})

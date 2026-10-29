@@ -3,7 +3,10 @@ package serial
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	stderrors "errors"
 	"io"
+	"strconv"
 
 	"github.com/ghodss/yaml"
 	"github.com/pelletier/go-toml"
@@ -40,6 +43,59 @@ func findOffset(b []byte, o int) *offset {
 	return &offset{line: line, char: char}
 }
 
+// duplicateNameError is a repeated object name in config JSON.
+// offset is a byte index into the comment-stripped document, or -1 if unknown.
+type duplicateNameError struct {
+	name   string
+	offset int
+}
+
+func (e *duplicateNameError) Error() string {
+	if e.name == "" {
+		return "duplicate key"
+	}
+	return "duplicate key " + strconv.Quote(e.name)
+}
+
+// rejectDuplicateObjectKeys reports a repeated object name.
+// encoding/json accepts duplicates: a scalar keeps the last value, and
+// PortList.UnmarshalJSON appends, so a second "port" would listen as well.
+// One key whose value is a list ("1-3", "80,443", or a JSON array) is not repeated.
+// Syntax errors are left to the decoder that follows.
+func rejectDuplicateObjectKeys(data []byte) error {
+	dec := jsontext.NewDecoder(bytes.NewReader(data),
+		jsontext.AllowDuplicateNames(false),
+		jsontext.AllowInvalidUTF8(true),
+	)
+	_, err := dec.ReadValue()
+	if err == nil || !stderrors.Is(err, jsontext.ErrDuplicateName) {
+		return nil
+	}
+	dup := &duplicateNameError{offset: -1}
+	var syn *jsontext.SyntacticError
+	if stderrors.As(err, &syn) {
+		dup.name = syn.JSONPointer.LastToken()
+		dup.offset = int(syn.ByteOffset)
+	}
+	return dup
+}
+
+func readConfigError(data []byte, err error) error {
+	var pos *offset
+	switch tErr := errors.Cause(err).(type) {
+	case *json.SyntaxError:
+		pos = findOffset(data, int(tErr.Offset))
+	case *json.UnmarshalTypeError:
+		pos = findOffset(data, int(tErr.Offset))
+	case *duplicateNameError:
+		pos = findOffset(data, tErr.offset)
+	}
+	if pos != nil {
+		return errors.New("failed to read config file at line ", pos.line, " char ", pos.char).Base(err)
+	}
+	return errors.New("failed to read config file").Base(err)
+}
+
 // DecodeJSONConfig reads from reader and decode the config into *conf.Config
 // syntax error could be detected.
 //
@@ -49,24 +105,17 @@ func DecodeJSONConfig(reader io.Reader) (*conf.Config, error) {
 	jsonConfig := &conf.Config{}
 
 	jsonContent := bytes.NewBuffer(make([]byte, 0, 10240))
-	jsonReader := io.TeeReader(&json_reader.Reader{
-		Reader: reader,
-	}, jsonContent)
-	decoder := json.NewDecoder(jsonReader)
-
-	if err := decoder.Decode(jsonConfig); err != nil {
-		var pos *offset
-		cause := errors.Cause(err)
-		switch tErr := cause.(type) {
-		case *json.SyntaxError:
-			pos = findOffset(jsonContent.Bytes(), int(tErr.Offset))
-		case *json.UnmarshalTypeError:
-			pos = findOffset(jsonContent.Bytes(), int(tErr.Offset))
-		}
-		if pos != nil {
-			return nil, errors.New("failed to read config file at line ", pos.line, " char ", pos.char).Base(err)
-		}
+	if _, err := jsonContent.ReadFrom(&json_reader.Reader{Reader: reader}); err != nil {
 		return nil, errors.New("failed to read config file").Base(err)
+	}
+	data := jsonContent.Bytes()
+	if err := rejectDuplicateObjectKeys(data); err != nil {
+		return nil, readConfigError(data, err)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(jsonConfig); err != nil {
+		return nil, readConfigError(data, err)
 	}
 
 	return jsonConfig, nil
@@ -81,6 +130,9 @@ func DecodeJSONConfigStrict(reader io.Reader) (*conf.Config, error) {
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, errors.New("failed to read config file").Base(err)
+	}
+	if err := rejectDuplicateObjectKeys(data); err != nil {
+		return nil, errors.New("failed to parse remote JSON config").Base(err)
 	}
 	jsonConfig := &conf.Config{}
 	if err := json.Unmarshal(data, jsonConfig); err != nil {

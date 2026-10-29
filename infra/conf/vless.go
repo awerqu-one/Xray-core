@@ -151,7 +151,8 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
 		if config.Decryption == "" {
 			return nil, errors.New(`VLESS settings: please add/set "decryption":"none" to every settings`)
 		}
-		return nil, errors.New(`VLESS settings: unsupported "decryption": ` + config.Decryption)
+		// The value is an X25519 private key and/or an ML-KEM seed. Do not append it.
+		return nil, errors.New(`VLESS settings: unsupported "decryption"`)
 	}
 
 	if config.Decryption != "none" && c.Fallbacks != nil {
@@ -374,7 +375,8 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
 				if account.Encryption == "" {
 					return nil, errors.New(`VLESS users: please add/set "encryption":"none" for every user`)
 				}
-				return nil, errors.New(`VLESS users: unsupported "encryption": ` + account.Encryption)
+				// The value may be the server decryption string (private key and seed).
+				return nil, errors.New(`VLESS users: unsupported "encryption"`)
 			}
 
 			user.Account = serial.ToTypedMessage(account)

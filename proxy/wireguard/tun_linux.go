@@ -264,15 +264,20 @@ func (tun *kernelTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (net.Conn, er
 	}, nil
 }
 
+// capUserDataV3 is the pair of records LINUX_CAPABILITY_VERSION_3 writes.
+func capUserDataV3() [2]unix.CapUserData {
+	return [2]unix.CapUserData{}
+}
+
 func KernelTunSupported() (bool, error) {
 	var hdr unix.CapUserHeader
 	hdr.Version = unix.LINUX_CAPABILITY_VERSION_3
 	hdr.Pid = 0 // 0 means current process
 
-	var data unix.CapUserData
-	if err := unix.Capget(&hdr, &data); err != nil {
+	data := capUserDataV3()
+	if err := unix.Capget(&hdr, &data[0]); err != nil {
 		return false, fmt.Errorf("failed to get capabilities: %v", err)
 	}
 
-	return (data.Effective & (1 << unix.CAP_NET_ADMIN)) != 0, nil
+	return (data[0].Effective & (1 << unix.CAP_NET_ADMIN)) != 0, nil
 }

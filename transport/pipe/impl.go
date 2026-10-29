@@ -64,7 +64,9 @@ func (p *pipe) getState(forRead bool) error {
 		if !forRead {
 			return io.ErrClosedPipe
 		}
-		if !p.data.IsEmpty() {
+		// A queued length-0 UDP datagram has no bytes, so IsEmpty is true,
+		// but it is still a datagram the reader has not taken.
+		if len(p.data) > 0 {
 			return nil
 		}
 		return io.EOF
@@ -141,8 +143,18 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 	return nil
 }
 
+// carriesUDP reports whether mb is a datagram rather than an empty TCP read.
+func carriesUDP(mb buf.MultiBuffer) bool {
+	for _, b := range mb {
+		if b != nil && b.UDP != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	if mb.IsEmpty() {
+	if mb.IsEmpty() && !carriesUDP(mb) {
 		return nil
 	}
 
@@ -191,7 +203,7 @@ func (p *pipe) Interrupt() {
 	p.Lock()
 	defer p.Unlock()
 
-	if !p.data.IsEmpty() {
+	if len(p.data) > 0 {
 		buf.ReleaseMulti(p.data)
 		p.data = nil
 		if p.state == closed {

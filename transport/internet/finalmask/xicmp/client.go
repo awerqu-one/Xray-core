@@ -51,17 +51,20 @@ type xicmpConnClient struct {
 }
 
 func NewConnClient(c *Config, dest *net.Destination) (net.PacketConn, error) {
-	var icmp4, icmp6 *icmp.PacketConn
-	var err4, err6 error
+	network4, address4 := "ip4:icmp", "0.0.0.0"
+	network6, address6 := "ip6:ipv6-icmp", "::"
 	if c.DGRAM {
-		icmp4, err4 = icmp.ListenPacket("udp4", "0.0.0.0")
-		icmp6, err6 = icmp.ListenPacket("udp6", "::")
-	} else {
-		icmp4, err4 = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-		icmp6, err6 = icmp.ListenPacket("ip6:ipv6-icmp", "::")
+		network4, address4 = "udp4", "0.0.0.0"
+		network6, address6 = "udp6", "::"
 	}
-	if err4 != nil || err6 != nil {
-		return nil, errors.Combine(err4, err6)
+	icmp4, err := listenICMP(network4, address4)
+	if err != nil {
+		return nil, err
+	}
+	icmp6, err := listenICMP(network6, address6)
+	if err != nil {
+		_ = icmp4.Close()
+		return nil, err
 	}
 
 	ips := make([]netip.Addr, 0, len(c.IPs))

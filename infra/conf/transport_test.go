@@ -1,10 +1,13 @@
 package conf_test
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	. "github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/transport/internet"
 	finalmaskcustom "github.com/xtls/xray-core/transport/internet/finalmask/header/custom"
@@ -362,5 +365,44 @@ func TestXDriveTemplateNeedsTemplate(t *testing.T) {
 	}
 	if _, err := config.Build(); err == nil {
 		t.Fatal("Build accepted a template service without a template")
+	}
+}
+
+func TestInvalidECHConfigOmitsKey(t *testing.T) {
+	const token = "SECRETTOKEN"
+	_, err := (&TLSConfig{ECHServerKeys: token}).Build()
+	if err == nil {
+		t.Fatal("invalid ECH config was accepted")
+	}
+	if _, ok := err.(*xerrors.Error); !ok {
+		t.Fatal("invalid ECH config error type changed")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "invalid ECH Config") || strings.Contains(message, token) {
+		t.Fatal("invalid ECH config error should name the failure and omit the key")
+	}
+}
+
+func TestInvalidMldsa65SeedOmitsSeed(t *testing.T) {
+	const token = "SECRETTOKEN"
+	privateKey := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	_, err := (&REALITYConfig{
+		Dest:        json.RawMessage(`"example.com:443"`),
+		ServerNames: []string{"example.com"},
+		PrivateKey:  privateKey,
+		ShortIds:    []string{"01"},
+		Mldsa65Seed: token,
+	}).Build()
+	if err == nil {
+		t.Fatal("invalid mldsa65 seed was accepted")
+	}
+	if _, ok := err.(*xerrors.Error); !ok {
+		t.Fatal("invalid mldsa65 seed error type changed")
+	}
+	message := err.Error()
+	if !strings.Contains(message, `invalid "mldsa65Seed"`) ||
+		strings.Contains(message, token) ||
+		strings.Contains(message, privateKey) {
+		t.Fatal("invalid mldsa65 seed error should name the failure and omit the seed")
 	}
 }

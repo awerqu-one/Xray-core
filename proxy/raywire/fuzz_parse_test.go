@@ -229,8 +229,23 @@ func referenceDatagrams(in []byte) ([]refDatagram, error) {
 		}
 		addr := in[pos : pos+alen]
 		pos += alen
-		if xnet.ParseAddress(string(addr)).String() == "" {
+		// Independent of parseDatagramAddress: an address that parses as nothing
+		// is refused, a domain whose text is an IP is that IP, and ASCII controls
+		// are refused before that parse.
+		for _, b := range addr {
+			if b < ' ' || b == 0x7F {
+				return out, errDatagramAddress
+			}
+		}
+		parsed := xnet.ParseAddress(string(addr))
+		if parsed.String() == "" {
 			return out, errDatagramAddress
+		}
+		if parsed.Family().IsDomain() {
+			again := xnet.ParseAddress(parsed.String())
+			if again.String() != "" && !again.Family().IsDomain() {
+				parsed = again
+			}
 		}
 		if len(in)-pos < 2 {
 			return out, io.ErrUnexpectedEOF
@@ -243,7 +258,7 @@ func referenceDatagrams(in []byte) ([]refDatagram, error) {
 		payload := in[pos : pos+size]
 		pos += size
 		out = append(out, refDatagram{
-			dest:    xnet.UDPDestination(xnet.ParseAddress(string(addr)), xnet.Port(port)),
+			dest:    xnet.UDPDestination(parsed, xnet.Port(port)),
 			payload: payload,
 		})
 	}

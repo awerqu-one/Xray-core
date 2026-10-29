@@ -51,7 +51,12 @@ type ReplayFilter struct {
 	mu        sync.Mutex
 	entries   map[string]*list.Element // ephemeral key to its element in order
 	perClient map[string]int           // client to its number of entries
-	order     *list.List               // *replayEntry, oldest accepted first
+	order     *list.List               // *replayEntry, oldest wall time first
+	// recent is the last element placed, or a neighbor once that element is
+	// removed. It is nil when the list no longer holds it. The next handshake
+	// is usually at that wall time or later, so a backward step does not walk
+	// the list on every accept.
+	recent *list.Element
 }
 
 type replayEntry struct {
@@ -93,9 +98,16 @@ func newReplayFilterAt(notBefore time.Time) *ReplayFilter {
 // A legitimate client whose clock lags the server by up to maxClockSkew is
 // refused for that long after a restart, and then retries with a newer timestamp.
 func (f *ReplayFilter) Accept(client string, ephemeral []byte, ts, now time.Time) bool {
+	// Wall clock only. A monotonic reading would let expiry run ahead of the
+	// skew check after a backward step.
+	now = now.Round(0)
+	ts = ts.Round(0)
 	if d := now.Sub(ts); d > maxClockSkew || d < -maxClockSkew {
 		return false
 	}
+	// notBefore is the wall time at process start. A timestamp made before it
+	// is refused even inside the skew window; otherwise a captured pre-restart
+	// message becomes valid again whenever the clock steps behind notBefore.
 	if ts.Before(f.notBefore) {
 		return false
 	}
@@ -114,13 +126,52 @@ func (f *ReplayFilter) Accept(client string, ephemeral []byte, ts, now time.Time
 	if f.perClient[client] >= maxReplayPerClient {
 		return false
 	}
-	f.entries[key] = f.order.PushBack(&replayEntry{key: key, client: client, at: now})
+	f.entries[key] = f.place(&replayEntry{key: key, client: client, at: now})
 	f.perClient[client]++
 	return true
 }
 
+// place inserts entry in wall-time order and returns its element. The caller
+// must hold mu. Expire stops at the first key still inside the window, which
+// is sound only while at does not go backward along the list. A later
+// handshake can carry an earlier wall time, so it is inserted there instead
+// of behind a timestamp that is still inside the window.
+func (f *ReplayFilter) place(entry *replayEntry) *list.Element {
+	at := entry.at
+	back := f.order.Back()
+	if back == nil || !at.Before(back.Value.(*replayEntry).at) {
+		f.recent = f.order.PushBack(entry)
+		return f.recent
+	}
+
+	e := f.recent
+	if e == nil {
+		e = back
+	}
+	if at.Before(e.Value.(*replayEntry).at) {
+		for e != nil && at.Before(e.Value.(*replayEntry).at) {
+			e = e.Prev()
+		}
+		if e == nil {
+			f.recent = f.order.PushFront(entry)
+		} else {
+			f.recent = f.order.InsertAfter(entry, e)
+		}
+		return f.recent
+	}
+	for next := e.Next(); next != nil; next = e.Next() {
+		if at.Before(next.Value.(*replayEntry).at) {
+			f.recent = f.order.InsertBefore(entry, next)
+			return f.recent
+		}
+		e = next
+	}
+	f.recent = f.order.PushBack(entry)
+	return f.recent
+}
+
 // expire forgets keys accepted more than replayWindow before now. The list is
-// in acceptance order, so it stops at the first key still in the window. The
+// in wall-time order, so it stops at the first key still in the window. The
 // caller must hold mu.
 func (f *ReplayFilter) expire(now time.Time) {
 	for e := f.order.Front(); e != nil; e = f.order.Front() {
@@ -134,6 +185,13 @@ func (f *ReplayFilter) expire(now time.Time) {
 // remove deletes one element from the list, the map and the client's count. The
 // caller must hold mu.
 func (f *ReplayFilter) remove(e *list.Element) {
+	if f.recent == e {
+		if p := e.Prev(); p != nil {
+			f.recent = p
+		} else {
+			f.recent = e.Next()
+		}
+	}
 	entry := f.order.Remove(e).(*replayEntry)
 	delete(f.entries, entry.key)
 	if f.perClient[entry.client]--; f.perClient[entry.client] == 0 {

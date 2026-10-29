@@ -302,9 +302,157 @@ func TestReplayFilterCanonicalKey(t *testing.T) {
 	}
 }
 
-// TestReplayFilterRefusesBeforeCreation checks the notBefore check on its own.
-// The timestamp is inside the skew window, so only the filter's start can refuse
-// it. A timestamp at the start is still accepted.
+// TestReplayFilterClockStepBackAcceptsFreshRealTimeHandshake checks that a
+// client whose clock tracks real time is accepted after the server clock steps
+// backward. The client timestamp is still at or after notBefore.
+func TestReplayFilterClockStepBackAcceptsFreshRealTimeHandshake(t *testing.T) {
+	f := newReplayFilterAt(testNow)
+	stepped := testNow.Add(-30 * time.Second)
+	fresh := testNow.Add(time.Second)
+	if !f.Accept(testClient, ephemeralKey(9), fresh, stepped) {
+		t.Fatal("a backward clock step refused a fresh real-time handshake")
+	}
+}
+
+// TestReplayFilterBackwardStepExpiresWallOldEntries checks a key accepted after
+// the wall clock steps backward. That key's window is its own wall time, so it
+// is forgotten while a key accepted earlier, at a later wall time, is kept.
+func TestReplayFilterBackwardStepExpiresWallOldEntries(t *testing.T) {
+	f := NewReplayFilter()
+	if !f.Accept(testClient, ephemeralKey(1), testNow, testNow) {
+		t.Fatal("first handshake was rejected")
+	}
+	stepped := testNow.Add(-3 * replayWindow)
+	if !f.Accept(testClient, ephemeralKey(2), stepped, stepped) {
+		t.Fatal("handshake after a backward step was rejected")
+	}
+
+	// The stepped key is replayWindow+1ns old. The earlier key is still inside
+	// its window because its wall time is ahead of the stepped clock.
+	now := stepped.Add(replayWindow + time.Nanosecond)
+	if !f.Accept(testClient, ephemeralKey(3), now, now) {
+		t.Fatal("handshake was rejected while a wall-old entry should have expired")
+	}
+	if _, ok := f.entries[string(ephemeralKey(2))]; ok {
+		t.Fatal("key accepted after the step was kept past its window")
+	}
+	if _, ok := f.entries[string(ephemeralKey(1))]; !ok {
+		t.Fatal("key from before the step was dropped inside its window")
+	}
+	if !f.Accept(testClient, ephemeralKey(2), now, now) {
+		t.Fatal("expired key was still remembered")
+	}
+	if f.Accept(testClient, ephemeralKey(1), now, now) {
+		t.Fatal("key still inside its window was forgotten")
+	}
+}
+
+// TestReplayFilterBackwardStepDoesNotExhaustQuota checks that entries accepted
+// after a backward step are not charged to a client for the whole step. Once
+// their own window has passed, the client can handshake again. The key accepted
+// before the step is still a replay.
+func TestReplayFilterBackwardStepDoesNotExhaustQuota(t *testing.T) {
+	f := NewReplayFilter()
+	if !f.Accept("alice", ephemeralKey(0), testNow, testNow) {
+		t.Fatal("pre-step handshake was rejected")
+	}
+	stepped := testNow.Add(-3 * replayWindow)
+	for i := 1; i < maxReplayPerClient; i++ {
+		if !f.Accept("alice", ephemeralKey(i), stepped, stepped) {
+			t.Fatalf("post-step handshake %d was rejected", i)
+		}
+	}
+	if f.Accept("alice", ephemeralKey(maxReplayPerClient), stepped, stepped) {
+		t.Fatal("alice was accepted above her quota")
+	}
+
+	now := stepped.Add(replayWindow + time.Nanosecond)
+	if !f.Accept("alice", ephemeralKey(maxReplayPerClient), now, now) {
+		t.Fatal("alice was refused after her post-step entries expired")
+	}
+	if f.Accept("alice", ephemeralKey(0), now, now) {
+		t.Fatal("pre-step key was forgotten inside its window")
+	}
+	if n := f.perClient["alice"]; n != 2 {
+		t.Fatalf("alice holds %d entries, want 2", n)
+	}
+}
+
+// TestReplayFilterBackwardStepDoesNotFillCache checks that a backward step
+// cannot leave the cache full of keys whose wall time is already past the
+// window. A new handshake is refused while those keys are still inside it, and
+// accepted once they are not. The pre-step key stays a replay.
+func TestReplayFilterBackwardStepDoesNotFillCache(t *testing.T) {
+	f := NewReplayFilter()
+	if !f.Accept("anchor", ephemeralKey(0), testNow, testNow) {
+		t.Fatal("pre-step handshake was rejected")
+	}
+	stepped := testNow.Add(-3 * replayWindow)
+	for i := 1; i < maxReplayEntries; i++ {
+		client := strconv.Itoa(i / maxReplayPerClient)
+		if !f.Accept(client, ephemeralKey(i), stepped, stepped) {
+			t.Fatalf("post-step handshake %d from client %s was rejected", i, client)
+		}
+	}
+	if f.Accept("extra", ephemeralKey(maxReplayEntries), stepped, stepped) {
+		t.Fatal("handshake was accepted by a full filter")
+	}
+
+	now := stepped.Add(replayWindow + time.Nanosecond)
+	if !f.Accept("extra", ephemeralKey(maxReplayEntries), now, now) {
+		t.Fatal("a backward step refused a new handshake after wall-old entries should have expired")
+	}
+	if f.Accept("anchor", ephemeralKey(0), now, now) {
+		t.Fatal("pre-step key was forgotten inside its window")
+	}
+	if n := len(f.entries); n != 2 {
+		t.Fatalf("filter holds %d entries, want 2", n)
+	}
+}
+
+// TestReplayFilterClockStepsExpireByWallTime checks several steps, forward and
+// back, all inside one replay window of each other so none expire early. The
+// keys at the earliest wall time are then forgotten on their own, including
+// one accepted after a later wall time. Keys accepted at a later wall time stay.
+func TestReplayFilterClockStepsExpireByWallTime(t *testing.T) {
+	f := NewReplayFilter()
+	// Offsets stay within replayWindow of one another, so accepting a later
+	// wall time does not expire an earlier one before the check below.
+	steps := []time.Duration{
+		0,
+		-8 * time.Minute,
+		-3 * time.Minute,
+		-9 * time.Minute,
+		time.Minute,
+		-9 * time.Minute,
+	}
+	for i, d := range steps {
+		at := testNow.Add(d)
+		if !f.Accept(testClient, ephemeralKey(i), at, at) {
+			t.Fatalf("handshake at %v was rejected", d)
+		}
+	}
+
+	earliest := testNow.Add(-9 * time.Minute)
+	now := earliest.Add(replayWindow + time.Nanosecond)
+	if !f.Accept(testClient, ephemeralKey(len(steps)), now, now) {
+		t.Fatal("handshake was rejected while only the earliest wall times should have expired")
+	}
+	for _, i := range []int{3, 5} {
+		if _, ok := f.entries[string(ephemeralKey(i))]; ok {
+			t.Fatalf("key %d accepted at -9min was kept past its window", i)
+		}
+		if !f.Accept(testClient, ephemeralKey(i), now, now) {
+			t.Fatalf("expired key %d was still remembered", i)
+		}
+	}
+	for _, i := range []int{0, 1, 2, 4} {
+		if f.Accept(testClient, ephemeralKey(i), now, now) {
+			t.Fatalf("key %d was forgotten inside its window", i)
+		}
+	}
+}
+
 func TestReplayFilterRefusesBeforeCreation(t *testing.T) {
 	f := newReplayFilterAt(testNow)
 	if f.Accept(testClient, ephemeralKey(1), testNow.Add(-time.Nanosecond), testNow) {
@@ -336,6 +484,18 @@ func TestReplayFilterRestartRefusesCapturedMessage(t *testing.T) {
 	}
 	if !restarted.Accept(testClient, ephemeralKey(2), now, now) {
 		t.Fatal("handshake made after the restart was rejected")
+	}
+}
+
+// TestReplayFilterRestartGuardSurvivesClockStepBack checks that a pre-restart
+// capture is refused even when the wall clock is behind notBefore. The skew
+// check alone would accept it.
+func TestReplayFilterRestartGuardSurvivesClockStepBack(t *testing.T) {
+	f := newReplayFilterAt(testNow)
+	ts := testNow.Add(-30 * time.Second)
+	stepped := testNow.Add(-3 * time.Minute)
+	if f.Accept(testClient, ephemeralKey(9), ts, stepped) {
+		t.Fatal("pre-restart capture was accepted after a backward clock step")
 	}
 }
 

@@ -164,6 +164,129 @@ func TestEmptyDatagram(t *testing.T) {
 	}
 }
 
+// TestEmptyDatagramSurvivesCopy is the path client.go and server.go use.
+// buf.Copy must hand the length-0 datagram to the pipe, not drop it.
+func TestEmptyDatagramSurvivesCopy(t *testing.T) {
+	client, server := connPair(t)
+	closeIfStuck(t, server)
+
+	dest := udpDest("192.0.2.1", 53)
+	sent := []datagram{{dest, nil}, {dest, []byte("after")}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		err := sendAll(newPacketWriter(client, net.Destination{}), sent)
+		if err == nil {
+			err = client.CloseWrite()
+		}
+		errCh <- err
+	}()
+
+	pr, pw := pipe.New(pipe.WithoutSizeLimit())
+	copyErr := make(chan error, 1)
+	go func() {
+		err := buf.Copy(newPacketReader(server), pw)
+		pw.Close()
+		copyErr <- err
+	}()
+
+	got := collectDatagrams(t, pr, len(sent))
+	for i := range sent {
+		checkDatagram(t, got[i], sent[i])
+	}
+	if err := <-copyErr; err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
+func TestUnreadableAddressDropped(t *testing.T) {
+	client, server := connPair(t)
+	closeIfStuck(t, server)
+
+	good := datagram{udpDest("192.0.2.1", 53), []byte("ok")}
+	after := datagram{udpDest("192.0.2.1", 53), []byte("after")}
+	// These strings survive encodeHeader and used to be rejected by the reader
+	// before the payload length was read, which ended the stream.
+	bad := []net.Destination{
+		net.UDPDestination(net.DomainAddress(" "), 53),
+		net.UDPDestination(net.DomainAddress("\t"), 53),
+		net.UDPDestination(net.DomainAddress("[]"), 53),
+		net.UDPDestination(net.DomainAddress("[ ]"), 53),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		w := newPacketWriter(client, net.Destination{})
+		if err := sendDatagram(w, good); err != nil {
+			errCh <- err
+			return
+		}
+		for _, dest := range bad {
+			if err := sendDatagram(w, datagram{dest, []byte("nope")}); err != nil {
+				errCh <- err
+				return
+			}
+		}
+		errCh <- sendDatagram(w, after)
+	}()
+
+	r := newPacketReader(server)
+	checkDatagram(t, readDatagram(t, r), good)
+	checkDatagram(t, readDatagram(t, r), after)
+	if err := <-errCh; err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
+func TestSpacedBracketIPv6(t *testing.T) {
+	client, server := connPair(t)
+	closeIfStuck(t, server)
+
+	const addr = " [2001:db8::1]"
+	pkt := []byte{networkUDP, 0x00, 0x35, byte(len(addr))}
+	pkt = append(pkt, addr...)
+	pkt = append(pkt, 0x00, 0x01, 'q')
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := client.Write(pkt)
+		errCh <- err
+	}()
+
+	got := readDatagram(t, newPacketReader(server))
+	if got.dest.Address == nil || !got.dest.Address.Family().IsIPv6() {
+		t.Fatalf("address family = %v, dest = %s; want IPv6", got.dest.Address, got.dest)
+	}
+	if got.dest.Address.IP().String() != "2001:db8::1" || got.dest.Port != 53 {
+		t.Fatalf("dest = %s, want udp:[2001:db8::1]:53", got.dest)
+	}
+	if !bytes.Equal(got.payload, []byte("q")) {
+		t.Fatalf("payload = %q", got.payload)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The writer emits the canonical IP, not the spaced domain text.
+	client2, server2 := connPair(t)
+	closeIfStuck(t, server2)
+	raw := net.UDPDestination(net.DomainAddress(addr), 53)
+	errCh = make(chan error, 1)
+	go func() {
+		errCh <- sendDatagram(newPacketWriter(client2, net.Destination{}), datagram{raw, []byte("q")})
+	}()
+	got = readDatagram(t, newPacketReader(server2))
+	if got.dest.Address == nil || !got.dest.Address.Family().IsIPv6() || got.dest.Address.IP().String() != "2001:db8::1" {
+		t.Fatalf("written dest = %s, want IPv6 2001:db8::1", got.dest)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
 func TestMaxSizeDatagram(t *testing.T) {
 	client, server := connPair(t)
 

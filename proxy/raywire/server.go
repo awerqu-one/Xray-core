@@ -43,8 +43,10 @@ type Server struct {
 	replay *ReplayFilter
 	// seen remembers the heads of accepted handshakes, so a copy is refused before
 	// any DH (seen.go). It is released by Close.
-	seen *seenHeads
-	adm  *admission
+	seen  *seenHeads
+	adm   *admission
+	relay *admission
+	live  liveSessions
 	// headFails counts the first messages that fail the head check, and the
 	// handshakes accepted under previousPsk, for one summary line a minute.
 	headFails headFailLog
@@ -129,11 +131,11 @@ func (l *headFailLog) flush() {
 	ctx := context.Background()
 	switch {
 	case m == 0:
-		errors.LogInfo(ctx, "raywire: ", n, " first messages failed the head check in the last minute (wrong psk or serverPublicKey, old client, or probes)")
+		errors.LogInfo(ctx, "raywire: ", n, " first messages failed the head check in the last minute (wrong psk or serverPublicKey, old client, clock skew, replay, or probes)")
 	case n == 0:
 		errors.LogWarning(ctx, "raywire: ", m, " handshakes accepted under previousPsk in the last minute (inbound psk fingerprint ", fp, ")")
 	default:
-		errors.LogWarning(ctx, "raywire: ", n, " first messages failed the head check in the last minute (wrong psk or serverPublicKey, old client, or probes); ", m, " handshakes accepted under previousPsk in the last minute (inbound psk fingerprint ", fp, ")")
+		errors.LogWarning(ctx, "raywire: ", n, " first messages failed the head check in the last minute (wrong psk or serverPublicKey, old client, clock skew, replay, or probes); ", m, " handshakes accepted under previousPsk in the last minute (inbound psk fingerprint ", fp, ")")
 	}
 	sort.Strings(labels)
 	for _, label := range labels {
@@ -233,6 +235,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		replay:           newReplayFilterAt(now),
 		seen:             newSeenHeads(seenHeadCap, seenHeadTTL, now),
 		adm:              newAdmission(maxPendingHandshakes, maxPendingPerIP),
+		relay:            newAdmission(maxRelays, maxRelaysPerIP),
 	}
 	s.headFails.fp = fp
 	if keys.hasPrev {
@@ -346,7 +349,7 @@ func (s *Server) handlePreAuth(ctx context.Context, conn stat.Connection, pol pa
 		return nil, err
 	}
 	// relayToDecoy takes its own relay slot and closes the connection when none is free.
-	relayToDecoy(ctx, relayFrom, he.Consumed, he.LastRead, s.fallback)
+	relayToDecoy(ctx, relayFrom, he.Consumed, he.LastRead, s.fallback, s.relay)
 	return nil, err
 }
 
@@ -365,6 +368,23 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		}
 		return errors.New("raywire: rejected connection from ", conn.RemoteAddr()).Base(err)
 	}
+
+	if rc.peer == nil {
+		// Process only runs after authorize; a nil account would be a wiring
+		// bug. Refuse instead of dereferencing it in the live quota.
+		conn.Close()
+		return nil
+	}
+
+	// Hold the authenticated key's slot through every exit, including header
+	// errors and dispatch failures. UDP uses the same connection and quota.
+	release, ok := s.live.TryAcquire(rc.peer.PublicKey)
+	if !ok {
+		errors.LogDebug(ctx, "raywire: live session limit reached, closing connection")
+		conn.Close()
+		return nil
+	}
+	defer release()
 
 	// The header must arrive within the handshake timeout. The deadline is
 	// cleared after the header, so the idle timer governs the rest of the session.

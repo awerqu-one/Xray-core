@@ -156,7 +156,8 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 				return nil, errors.New(`"mldsa65Seed" and "privateKey" can not be the same value: `, c.Mldsa65Seed)
 			}
 			if config.Mldsa65Seed, err = base64.RawURLEncoding.DecodeString(c.Mldsa65Seed); err != nil || len(config.Mldsa65Seed) != 32 {
-				return nil, errors.New(`invalid "mldsa65Seed": `, c.Mldsa65Seed)
+				// Concat joins arguments with no separator, so the seed must stay out.
+				return nil, errors.New(`invalid "mldsa65Seed"`)
 			}
 		}
 
@@ -391,7 +392,8 @@ func (c *TLSConfig) Build() (proto.Message, error) {
 	if c.ECHServerKeys != "" {
 		EchPrivateKey, err := base64.StdEncoding.DecodeString(c.ECHServerKeys)
 		if err != nil {
-			return nil, errors.New("invalid ECH Config", c.ECHServerKeys)
+			// Concat joins arguments with no separator, so the key must stay out.
+			return nil, errors.New("invalid ECH Config")
 		}
 		config.EchServerKeys = EchPrivateKey
 	}

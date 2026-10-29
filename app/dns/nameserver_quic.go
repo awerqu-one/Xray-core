@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	stdnet "net"
 	"net/url"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -16,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol/dns"
 	"github.com/xtls/xray-core/common/session"
 	dns_feature "github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/net/http2"
 )
@@ -258,12 +261,20 @@ func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
 }
 
 func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
+	return s.openQUIC(context.Background())
+}
+
+func (s *QUICNameServer) openQUIC(ctx context.Context) (*quic.Conn, error) {
 	tlsConfig := tls.Config{}
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: handshakeTimeout,
 	}
 	tlsConfig.ServerName = s.destination.Address.String()
-	conn, err := quic.DialAddr(context.Background(), s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	pc, raddr, err := listenProtectedUDP(ctx, *s.destination)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := quic.Dial(ctx, pc, raddr, tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,
@@ -271,10 +282,41 @@ func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
 		Detour: "local",
 	})
 	if err != nil {
+		_ = pc.Close()
 		return nil, err
 	}
-
+	go func() {
+		<-conn.Context().Done()
+		_ = pc.Close()
+	}()
 	return conn, nil
+}
+
+// listenProtectedUDP listens on a UDP socket after the dialer controllers
+// have run. quic.DialAddr would open its own socket and skip them.
+func listenProtectedUDP(ctx context.Context, dest net.Destination) (stdnet.PacketConn, stdnet.Addr, error) {
+	raddr, err := stdnet.ResolveUDPAddr("udp", dest.NetAddr())
+	if err != nil {
+		return nil, nil, err
+	}
+	network := "udp4"
+	local := "0.0.0.0:0"
+	if ip4 := raddr.IP.To4(); ip4 != nil {
+		raddr.IP = ip4
+	} else {
+		network = "udp6"
+		local = "[::]:0"
+	}
+	lc := stdnet.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return internet.ApplyDialerControllers(network, address, c)
+		},
+	}
+	pc, err := lc.ListenPacket(ctx, network, local)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pc, raddr, nil
 }
 
 func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {

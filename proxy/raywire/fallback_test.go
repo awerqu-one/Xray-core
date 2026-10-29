@@ -98,7 +98,7 @@ func startRelay(prober net.Conn, consumed []byte, dest xnet.Destination) <-chan 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		relayToDecoy(context.Background(), prober, consumed, time.Now(), dest)
+		relayToDecoy(context.Background(), prober, consumed, time.Now(), dest, nil)
 	}()
 	return done
 }
@@ -189,15 +189,26 @@ func countDials(t *testing.T, fail error) *atomic.Int32 {
 	return &n
 }
 
-// plainProber hides CloseWrite, as the stat counters do, and counts Close.
+// plainProber has no half-close and does not embed the socket, so the relay
+// cannot find a CloseWrite under it. It counts Close.
 type plainProber struct {
-	net.Conn
+	c      net.Conn
 	closes atomic.Int32
+}
+
+func (p *plainProber) Read(b []byte) (int, error)        { return p.c.Read(b) }
+func (p *plainProber) Write(b []byte) (int, error)       { return p.c.Write(b) }
+func (p *plainProber) LocalAddr() net.Addr               { return p.c.LocalAddr() }
+func (p *plainProber) RemoteAddr() net.Addr              { return p.c.RemoteAddr() }
+func (p *plainProber) SetDeadline(t time.Time) error     { return p.c.SetDeadline(t) }
+func (p *plainProber) SetReadDeadline(t time.Time) error { return p.c.SetReadDeadline(t) }
+func (p *plainProber) SetWriteDeadline(t time.Time) error {
+	return p.c.SetWriteDeadline(t)
 }
 
 func (p *plainProber) Close() error {
 	p.closes.Add(1)
-	return p.Conn.Close()
+	return p.c.Close()
 }
 
 // logCapture keeps every log message while it is registered.
@@ -288,6 +299,32 @@ func TestRelayDeliversConsumedThenStream(t *testing.T) {
 	}
 }
 
+// shortWriteConn accepts at most limit bytes per Write, like a Conn that
+// returns a short count with no error.
+type shortWriteConn struct {
+	net.Conn
+	limit int
+	out   bytes.Buffer
+}
+
+func (c *shortWriteConn) Write(p []byte) (int, error) {
+	if len(p) > c.limit {
+		p = p[:c.limit]
+	}
+	return c.out.Write(p)
+}
+
+func TestReplayConsumedWritesEveryByteOnShortWrite(t *testing.T) {
+	const data = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
+	decoy := &shortWriteConn{limit: 7}
+	if !replayConsumed(context.Background(), &memConn{}, decoy, []byte(data)) {
+		t.Fatal("replayConsumed gave up on a short write")
+	}
+	if got := decoy.out.String(); got != data {
+		t.Fatalf("decoy received %q, want %q", got, data)
+	}
+}
+
 func TestRelayEmptyConsumedSendsNoWrite(t *testing.T) {
 	setRelayTimers(t, time.Second, time.Minute)
 	writes := recordDecoyWrites(t)
@@ -335,7 +372,7 @@ func TestRelayHalfCloseWithoutCloseWriteClosesProber(t *testing.T) {
 	})
 
 	tcp, external := tcpPair(t)
-	prober := &plainProber{Conn: tcp}
+	prober := &plainProber{c: tcp}
 	done := startRelay(prober, nil, dest)
 
 	// The decoy's output must reach the prober, and then the prober must see

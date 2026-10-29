@@ -13,7 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
+	"time"
 
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -82,17 +85,33 @@ func (e *StatusError) Error() string {
 }
 
 func NewClient(scheme, host, port, token string, tlsConfig *tls.Config) *Client {
-	client := http.DefaultClient
+	// Timeouts match net/http.DefaultTransport. DialContext is not the
+	// default dialer: Control runs the same controllers as DialSystem.
+	// A controller error fails this dial. It is not retried unprotected.
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return internet.ApplyDialerControllers(network, address, c)
+		},
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	if tlsConfig != nil {
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = tlsConfig.GetTLSConfig()
-		client = &http.Client{Transport: tr}
+		transport.TLSClientConfig = tlsConfig.GetTLSConfig()
 	}
 	return &Client{
 		scheme:     scheme,
 		hostport:   net.JoinHostPort(host, port),
 		token:      token,
-		httpClient: client,
+		httpClient: &http.Client{Transport: transport},
 	}
 }
 

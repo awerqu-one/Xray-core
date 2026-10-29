@@ -80,9 +80,17 @@ func decodeHeader(r io.Reader) (net.Destination, error) {
 		return net.Destination{}, errors.New("raywire: failed to read header address").Base(err)
 	}
 
+	// Refuse ASCII controls before ParseAddress. It trims only the ends, so a CR
+	// or LF between two letters would stay in the host and be dialed. isValidDomain
+	// rejects those bytes for VLESS and the other address parsers.
+	raw := string(address)
+	if hasASCIIControl(raw) {
+		return net.Destination{}, errors.New("raywire: header address contains a control character")
+	}
+
 	// ParseAddress trims spaces, so an address of only spaces becomes empty. Such a
 	// header could not be encoded again, so it is refused here.
-	addr := net.ParseAddress(string(address))
+	addr := net.ParseAddress(raw)
 	if addr.String() == "" {
 		return net.Destination{}, errors.New("raywire: header address is empty")
 	}
@@ -92,4 +100,14 @@ func decodeHeader(r io.Reader) (net.Destination, error) {
 		Port:    port,
 	}
 	return dest, nil
+}
+
+// hasASCIIControl reports whether s contains CR, LF, DEL, or another ASCII control.
+func hasASCIIControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] == 0x7F {
+			return true
+		}
+	}
+	return false
 }

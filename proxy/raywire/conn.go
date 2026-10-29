@@ -69,7 +69,10 @@ type Conn struct {
 	rhdr [frameHdrCipher]byte
 
 	wmu     sync.Mutex
-	wclosed bool // set by CloseWrite
+	wclosed bool // end-of-stream fully sent, or a frame was only partly written
+	// wsent is true when the last writeFrameV2 accepted every ciphertext byte.
+	// Those bytes must not be sealed again.
+	wsent bool
 
 	// peer is the server's account for the client that authenticated. It is nil on
 	// the client side.
@@ -86,7 +89,10 @@ func newConn(conn net.Conn, send, recv *noise.CipherState, pol padPolicy, firstF
 }
 
 // Write splits p into data frames of at most maxPayload bytes and sends each
-// one. After CloseWrite it returns io.ErrClosedPipe.
+// one. After CloseWrite it returns io.ErrClosedPipe. A frame that is only
+// partly written fails the write side, and a later Write sends nothing. A
+// Write that sends no byte leaves the cipher where it was, so the same bytes
+// can be written again.
 func (c *Conn) Write(p []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -97,18 +103,28 @@ func (c *Conn) Write(p []byte) (int, error) {
 	written := 0
 	for len(p) > 0 {
 		n := min(len(p), c.pad.maxPayload())
-		if err := c.writeFrameV2(frameData, p[:n]); err != nil {
+		err := c.writeFrameV2(frameData, p[:n])
+		if !c.wsent {
+			if err == nil {
+				err = io.ErrShortWrite
+			}
 			return written, err
 		}
 		written += n
 		p = p[n:]
+		if err != nil {
+			return written, err
+		}
 	}
 	return written, nil
 }
 
 // CloseWrite sends one end-of-stream frame, so the peer's Read returns io.EOF
 // after the data already sent. The read side stays open, and the connection
-// is not closed. Later calls return nil and send nothing.
+// is not closed. Once that frame has been fully written, later calls return
+// nil and send nothing. A call that sends no byte does not latch, so it can
+// be retried. A partly written frame does latch: another frame would not
+// authenticate.
 func (c *Conn) CloseWrite() error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -116,15 +132,24 @@ func (c *Conn) CloseWrite() error {
 	if c.wclosed {
 		return nil
 	}
-	// Set before sending. A partly written frame would corrupt any later one.
-	c.wclosed = true
-	return c.writeFrameV2(frameEnd, nil)
+	err := c.writeFrameV2(frameEnd, nil)
+	if c.wsent {
+		c.wclosed = true
+	}
+	return err
 }
 
 // writeFrameV2 seals one frame and sends it with a single Write. The body is
 // padded with zeros to the length frameBp chooses, and the padding is
 // authenticated with the rest of the body. The caller must hold wmu.
+//
+// The send cipher advances inside sealFrame, before the transport accepts the
+// bytes. A write that accepts none of them restores the nonce and leaves
+// firstFrameHS unchanged, so the caller can send the same frame again. A write
+// that accepts a prefix latches wclosed: the peer may already hold that prefix,
+// and a later frame would not authenticate.
 func (c *Conn) writeFrameV2(typ byte, payload []byte) error {
+	c.wsent = false
 	if len(payload) > c.pad.maxPayload() {
 		return errFrameTooLarge
 	}
@@ -134,12 +159,30 @@ func (c *Conn) writeFrameV2(typ byte, payload []byte) error {
 	binary.BigEndian.PutUint16(pt[1:frameHeaderSize], uint16(len(payload)))
 	copy(pt[frameHeaderSize:], payload)
 
+	n0 := c.send.Nonce()
 	wire, err := sealFrame(c.send, pt)
 	if err != nil {
+		c.send.SetNonce(n0)
+		return err
+	}
+	nw, err := c.Conn.Write(wire)
+	if nw != len(wire) {
+		if nw == 0 {
+			c.send.SetNonce(n0)
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+			return err
+		}
+		c.firstFrameHS = false
+		c.wclosed = true
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		return err
 	}
 	c.firstFrameHS = false
-	_, err = c.Conn.Write(wire)
+	c.wsent = true
 	return err
 }
 

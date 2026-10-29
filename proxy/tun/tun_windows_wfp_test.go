@@ -156,6 +156,9 @@ func TestResolveOnOwn(t *testing.T) {
 	if !net.DefaultResolver.PreferGo || net.DefaultResolver.Dial == nil {
 		t.Fatal("net.DefaultResolver is unchanged")
 	}
+	if !internet.OwnResolveEnabled() {
+		t.Fatal("own resolve is not enabled")
+	}
 	if _, err := net.DefaultResolver.Dial(context.Background(), "udp", "203.0.113.53:53"); err == nil {
 		t.Error("the TUN's DNS server was not skipped")
 	}
@@ -167,6 +170,9 @@ func TestResolveOnOwn(t *testing.T) {
 	saved.restore()
 	if net.DefaultResolver.PreferGo != preferGo || (net.DefaultResolver.Dial == nil) != (dial == nil) {
 		t.Error("net.DefaultResolver is not restored")
+	}
+	if internet.OwnResolveEnabled() {
+		t.Error("own resolve is still enabled")
 	}
 }
 

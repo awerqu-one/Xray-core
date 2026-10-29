@@ -5,13 +5,43 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"syscall"
+	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform/filesystem"
+	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/crypto/ocsp"
 )
+
+// ocspHTTP matches http.DefaultClient: no overall timeout, default redirects,
+// and a transport with DefaultTransport's dial timeout, keep-alive, and TLS
+// (nil TLSClientConfig, HTTP/2 still attempted). It is not DefaultClient.
+// Dialer Control runs ApplyDialerControllers. A protect error fails that
+// dial. It is not retried on http.DefaultTransport.
+var ocspHTTP = &http.Client{Transport: newProtectedHTTPTransport()}
+
+func newProtectedHTTPTransport() *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return internet.ApplyDialerControllers(network, address, c)
+		},
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
 
 func GetOCSPForFile(path string) ([]byte, error) {
 	return filesystem.ReadFile(path)
@@ -70,9 +100,9 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, errors.New("no issuing certificate URL")
 		}
-		resp, errC := http.Get(issuedCert.IssuingCertificateURL[0])
+		resp, errC := ocspHTTP.Get(issuedCert.IssuingCertificateURL[0])
 		if errC != nil {
-			return nil, errors.New("no issuing certificate URL")
+			return nil, errors.New("no issuing certificate URL").Base(errC)
 		}
 		defer resp.Body.Close()
 
@@ -95,7 +125,7 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		return nil, err
 	}
 	reader := bytes.NewReader(ocspReq)
-	req, err := http.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
+	req, err := ocspHTTP.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
 	if err != nil {
 		return nil, errors.New(err)
 	}

@@ -88,10 +88,21 @@ func IsWriteError(err error) bool {
 	return ok
 }
 
+// carriesUDP reports whether mb holds a datagram. A length-0 UDP payload is an
+// empty buffer with a destination, and dropping it loses that packet.
+func carriesUDP(mb MultiBuffer) bool {
+	for _, b := range mb {
+		if b != nil && b.UDP != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func copyInternal(reader Reader, writer Writer, handler *copyHandler) error {
 	for {
 		buffer, err := reader.ReadMultiBuffer()
-		if !buffer.IsEmpty() {
+		if !buffer.IsEmpty() || carriesUDP(buffer) {
 			for _, handler := range handler.onData {
 				handler(buffer)
 			}

@@ -9,13 +9,38 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/routing"
 	routing_session "github.com/xtls/xray-core/features/routing/session"
+	"github.com/xtls/xray-core/transport/internet"
 )
+
+// newProtectedHTTPTransport matches net/http.DefaultTransport (30s dial,
+// 30s keep-alive, nil TLSClientConfig, HTTP/2 still attempted). Control
+// runs ApplyDialerControllers. A protect error fails this dial. It is not
+// retried on http.DefaultTransport.
+func newProtectedHTTPTransport() *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return internet.ApplyDialerControllers(network, address, c)
+		},
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
 
 func ptr[T any](v T) *T { return &v }
 
@@ -53,23 +78,26 @@ func NewWebhookNotifier(cfg *WebhookConfig) (*WebhookNotifier, error) {
 	}
 
 	httpURL, socketPath := utils.SplitHTTPUnixURL(cfg.Url)
-	h := &WebhookNotifier{
-		url:           httpURL,
-		deduplication: cfg.Deduplication,
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
-		done: make(chan struct{}),
-	}
-
+	// Remote http(s) uses the protected dialer. A Unix socket is local and
+	// keeps the previous dialer, which does not call protect.
+	transport := newProtectedHTTPTransport()
 	if socketPath != "" {
 		dialAddr := utils.ResolveSocketPath(socketPath)
-		h.client.Transport = &http.Transport{
+		transport = &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, "unix", dialAddr)
 			},
 		}
+	}
+	h := &WebhookNotifier{
+		url:           httpURL,
+		deduplication: cfg.Deduplication,
+		client: &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: transport,
+		},
+		done: make(chan struct{}),
 	}
 
 	if len(cfg.Headers) > 0 {

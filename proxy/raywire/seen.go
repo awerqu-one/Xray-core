@@ -21,9 +21,10 @@ const (
 	// It is only in memory and is never on the wire.
 	seenClientLabel = "raywire/3 seen client"
 
-	// seenHeadTTL is how long a remembered head is refused. It is far longer than
-	// the replay window (replayWindow), so a head is still refused after the replay
-	// filter has forgotten it.
+	// seenHeadTTL is how long a remembered head is refused, measured on the wall
+	// clock. It is far longer than the replay window (replayWindow), so a head is
+	// still refused after the replay filter has forgotten it. A monotonic age would
+	// drop the head while a backward wall step still has its tag open.
 	seenHeadTTL = 24 * time.Hour
 
 	// seenHeadCap bounds the remembered heads, one slot each, with two keys per slot.
@@ -49,13 +50,14 @@ const (
 type seenSlot struct {
 	wire [seenKeyLen]byte // R_e[:16] of the head
 	dh   [seenKeyLen]byte // seenDHKey of the DH output of the head
-	at   time.Duration    // time of Remember, since seenHeads.base (monotonic)
-	next int32            // next slot of the same client, -1 at the newest one
+	at   time.Duration    // wall time of Remember, since seenHeads.base
+	next int32            // next slot of the same client, toward the later wall time, -1 at the latest
 }
 
-// seenClient holds the remembered heads of one client, as a FIFO from the oldest to
-// the newest. oldestAt caches the time of the oldest head, which orders the expiry
-// heap. heapAt is the index of the client in that heap, or -1.
+// seenClient holds the remembered heads of one client in wall-time order, earliest
+// first. oldestAt is that earliest time and orders the expiry heap. A later Remember
+// with an earlier wall time is linked at that time, so it is not hidden behind a
+// newer front. heapAt is the index of the client in the expiry heap, or -1.
 type seenClient struct {
 	key      [seenKeyLen]byte
 	count    int
@@ -65,9 +67,9 @@ type seenClient struct {
 	heapAt   int
 }
 
-// clientHeap is a min-heap of the clients that hold heads, ordered by the time of
-// their oldest head. The head of the heap is the next client that may have expired
-// heads, so expiry looks at one client when nothing has expired.
+// clientHeap is a min-heap of the clients that hold heads, ordered by the wall time
+// of their earliest head. That head is the front of the client's chain, so expiry
+// looks at one client when nothing has expired.
 type clientHeap []*seenClient
 
 func (h clientHeap) Len() int           { return len(h) }
@@ -122,9 +124,16 @@ type seenHeads struct {
 	closed   bool
 }
 
+// wallTime strips a monotonic reading. Ages in this memory are wall ages, as in
+// ReplayFilter, so Time.Sub cannot expire a head on monotonic time while the wall
+// clock, and therefore its tag bucket, has stepped backward.
+func wallTime(t time.Time) time.Time {
+	return t.Round(0)
+}
+
 // newSeenHeads returns an empty memory that holds at most capacity heads for ttl. Its
-// clock starts at now. All maps and the slots are allocated here, so no write can reach
-// a nil map.
+// wall clock starts at now. All maps and the slots are allocated here, so no write can
+// reach a nil map.
 func newSeenHeads(capacity int, ttl time.Duration, now time.Time) *seenHeads {
 	if capacity < 1 {
 		capacity = 1
@@ -134,7 +143,7 @@ func newSeenHeads(capacity int, ttl time.Duration, now time.Time) *seenHeads {
 		share = 1
 	}
 	s := &seenHeads{
-		base:     now,
+		base:     wallTime(now),
 		ttl:      ttl,
 		capacity: capacity,
 		share:    share,
@@ -302,15 +311,9 @@ func (s *seenHeads) insertLocked(c *seenClient, kw, kd [seenKeyLen]byte, now tim
 	i := s.free
 	sl := &s.slots[i]
 	s.free = sl.next
-	at := now.Sub(s.base)
+	at := wallTime(now).Sub(s.base)
 	*sl = seenSlot{wire: kw, dh: kd, at: at, next: -1}
-	if c.count == 0 {
-		c.oldest, c.oldestAt = i, at
-		heap.Push(&s.expiry, c)
-	} else {
-		s.slots[c.newest].next = i
-	}
-	c.newest = i
+	s.linkLocked(c, i, at)
 	c.count++
 	if c.count == s.share {
 		s.atShare = append(s.atShare, c)
@@ -318,6 +321,43 @@ func (s *seenHeads) insertLocked(c *seenClient, kw, kd [seenKeyLen]byte, now tim
 	s.byWire[kw] = struct{}{}
 	s.byDH[kd] = struct{}{}
 	s.n++
+}
+
+// linkLocked places slot i in c's chain in wall-time order. The front stays the
+// earliest head, so expiry can stop there. Equal times keep call order. The common
+// case, a time at or after the latest head, appends. The caller holds mu, and i is
+// already off the free list.
+func (s *seenHeads) linkLocked(c *seenClient, i int32, at time.Duration) {
+	sl := &s.slots[i]
+	if c.count == 0 {
+		c.oldest, c.newest, c.oldestAt = i, i, at
+		heap.Push(&s.expiry, c)
+		return
+	}
+	if at >= s.slots[c.newest].at {
+		s.slots[c.newest].next = i
+		c.newest = i
+		return
+	}
+	if at < c.oldestAt {
+		sl.next = c.oldest
+		c.oldest, c.oldestAt = i, at
+		heap.Fix(&s.expiry, c.heapAt)
+		return
+	}
+	prev := c.oldest
+	for {
+		next := s.slots[prev].next
+		if next < 0 || at < s.slots[next].at {
+			sl.next = next
+			s.slots[prev].next = i
+			if next < 0 {
+				c.newest = i
+			}
+			return
+		}
+		prev = next
+	}
 }
 
 // removeOldestLocked forgets the oldest head of client c and frees its slot. It serves
@@ -362,11 +402,11 @@ func (s *seenHeads) dropAtShareLocked(c *seenClient) {
 	}
 }
 
-// expireLocked forgets the heads remembered more than ttl before now. Each client is
-// in insertion order, and the expiry heap gives the client whose oldest head is the
-// oldest of all, so only the heads that have expired are touched. The caller must hold mu.
+// expireLocked forgets heads whose wall time is more than ttl before now. Each
+// client's chain is in wall-time order and the heap orders clients by their earliest
+// head, so only expired heads are removed. The caller must hold mu.
 func (s *seenHeads) expireLocked(now time.Time) {
-	limit := now.Sub(s.base) - s.ttl
+	limit := wallTime(now).Sub(s.base) - s.ttl
 	for len(s.expiry) > 0 && s.expiry[0].oldestAt < limit {
 		s.removeOldestLocked(s.expiry[0])
 	}

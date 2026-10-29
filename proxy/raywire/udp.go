@@ -48,11 +48,18 @@ func newPacketWriter(c *Conn, def net.Destination) buf.Writer {
 
 // WriteMultiBuffer implements buf.Writer. It takes ownership of mb. It stops at
 // the first datagram it cannot send, and datagrams before that one are sent.
+// A datagram whose address the reader would reject is dropped instead of
+// failing the write. Sending it would make the reader stop before the payload
+// length, and every later datagram on that stream would be lost.
 func (w *packetWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
 	for _, b := range mb {
-		if err := w.writeDatagram(b); err != nil {
+		err := w.writeDatagram(b)
+		if errors.Is(err, errDatagramAddress) {
+			continue
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -76,6 +83,17 @@ func (w *packetWriter) writeDatagram(b *buf.Buffer) error {
 	payload := b.Bytes()
 	if len(payload) > maxDatagramPayload {
 		return errDatagramTooLarge
+	}
+	// Port 0 and a missing address still fail the write. An address that is
+	// present but empty once parsed is errDatagramAddress, which the caller
+	// drops. The bytes written are the address the reader will store, so a
+	// bracketed IP with surrounding space is not left as a domain.
+	if dest.Address != nil && dest.Port != 0 {
+		parsed, err := parseDatagramAddress(dest.Address.String())
+		if err != nil {
+			return err
+		}
+		dest.Address = parsed
 	}
 	block, err := encodeHeader(dest)
 	if err != nil {
@@ -151,11 +169,12 @@ func (r *packetReader) readDatagram() (buf.MultiBuffer, error) {
 	if _, err := io.ReadFull(r.c, address); err != nil {
 		return nil, io.ErrUnexpectedEOF
 	}
-	// As in decodeHeader, an address of only spaces is empty once trimmed, and the
-	// datagram would have no destination to reply from.
-	addr := net.ParseAddress(string(address))
-	if addr.String() == "" {
-		return nil, errDatagramAddress
+	// Same rules as the writer. An address of only spaces, "[]", or "[ ]" has
+	// no destination to reply from. A bracketed IP that the first parse leaves
+	// as a domain is read as that IP.
+	addr, err := parseDatagramAddress(string(address))
+	if err != nil {
+		return nil, err
 	}
 
 	var lengthBuf [2]byte
@@ -174,11 +193,42 @@ func (r *packetReader) readDatagram() (buf.MultiBuffer, error) {
 	return buf.MultiBuffer{b}, nil
 }
 
+// parseDatagramAddress returns the address stored for a datagram. The reader
+// and the writer both use it. A string that trims or unwraps to nothing is
+// refused. ParseAddress turns " [2001:db8::1]" into the domain "[2001:db8::1]"
+// because it trims only after the bracket check, so a domain whose text parses
+// as an IP is parsed again.
+func parseDatagramAddress(raw string) (net.Address, error) {
+	// Same bytes decodeHeader refuses. Checked before ParseAddress, which would
+	// trim a control off either end and keep one in the middle. The empty-address
+	// error is what the writer already drops, so this datagram is not sent and
+	// the reader does not hand it to a dial.
+	if hasASCIIControl(raw) {
+		return nil, errDatagramAddress
+	}
+	parsed := net.ParseAddress(raw)
+	if parsed.String() == "" {
+		return nil, errDatagramAddress
+	}
+	if parsed.Family().IsDomain() {
+		again := net.ParseAddress(parsed.String())
+		if again.String() != "" && !again.Family().IsDomain() {
+			parsed = again
+		}
+	}
+	return parsed, nil
+}
+
 // newDatagramBuffer returns an empty buffer that can hold a payload of size
 // bytes. A payload larger than buf.Size gets a buffer of its own size, not a
 // chain of buffers. The datagram stays one buffer, so downstream code writes it
 // as one packet. Splitting it would turn each piece into a separate packet.
+// A length of 0 is a real datagram, but it must not take a pooled slab: a
+// caller that skips empty buffers does not release them.
 func newDatagramBuffer(size int) *buf.Buffer {
+	if size == 0 {
+		return buf.FromBytes(nil)
+	}
 	if size <= buf.Size {
 		return buf.New()
 	}

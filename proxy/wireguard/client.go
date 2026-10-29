@@ -107,12 +107,17 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		dnses = append(dnses, netip.MustParseAddr(dns))
 	}
 
-	kernelTunSupported, err := KernelTunSupported()
-	if err != nil {
-		errors.LogWarningInner(context.Background(), err, "Failed to check kernel TUN support")
+	kernelTunSupported := false
+	if !conf.NoKernelTun {
+		supported, capErr := KernelTunSupported()
+		if capErr != nil {
+			errors.LogWarningInner(context.Background(), capErr, "Failed to check kernel TUN support")
+		}
+		kernelTunSupported = supported
 	}
 	var tun tun.Device
 	var tnet *Net
+	var err error
 	if !conf.NoKernelTun && kernelTunSupported {
 		errors.LogWarning(context.Background(), "Using kernel TUN")
 		tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))

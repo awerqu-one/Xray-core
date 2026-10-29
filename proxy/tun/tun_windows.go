@@ -388,9 +388,18 @@ type savedResolver struct {
 // through the TUN only, so Xray's own lookups, like of an outbound's server
 // domain, would go into Xray again and could end up waiting on themselves.
 //
+// A non-literal dial does not use that resolver. SetOwnResolve sends the
+// name through the Xray DNS client, which answers from static hosts (the
+// bootstrap map) or, when that client does not use the system resolver, from
+// the client's own name servers. A literal address is not looked up, and the
+// name is not queried on the physical interface's port-53 servers.
+//
 // It changes net.DefaultResolver for the whole process, which covers every
-// lookup that would reach Windows' resolver; restore undoes it.
+// other lookup that would reach Windows' resolver; restore undoes it.
 func resolveOnOwn() *savedResolver {
+	// On before the resolver swap, so a dial in between cannot ask the
+	// physical resolvers for a domain.
+	internet.SetOwnResolve(true)
 	saved := &savedResolver{net.DefaultResolver.PreferGo, net.DefaultResolver.Dial}
 	dialer := &net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
 		for _, ctl := range internet.DialerControllers() {
@@ -414,6 +423,9 @@ func resolveOnOwn() *savedResolver {
 func (s *savedResolver) restore() {
 	net.DefaultResolver.PreferGo = s.preferGo
 	net.DefaultResolver.Dial = s.dial
+	// Off after the previous resolver is back. While the flag is still on,
+	// a domain dial uses the DNS client rather than this resolver.
+	internet.SetOwnResolve(false)
 }
 
 // tunOnlyDNS returns those of servers, the TUN's DNS servers, that Go's

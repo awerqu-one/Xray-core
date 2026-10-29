@@ -234,6 +234,42 @@ func (s *DNS) MayUseSystemResolver() bool {
 	return false
 }
 
+// LookupHosts answers from the static hosts map only, including a bootstrap
+// map written into dns.hosts. It does not query a name server. A nil slice
+// and a nil error mean the name is not an IP mapping in the map. A domain
+// alias that unwraps to IPs is returned as those IPs.
+func (s *DNS) LookupHosts(domain string) ([]net.IP, error) {
+	domain = strings.TrimSuffix(domain, ".")
+	if domain == "" {
+		return nil, errors.New("empty domain name")
+	}
+	if s.hosts == nil {
+		return nil, nil
+	}
+	option := dns.IPOption{IPv4Enable: true, IPv6Enable: true}
+	if s.ipOption != nil {
+		option.IPv4Enable = s.ipOption.IPv4Enable
+		option.IPv6Enable = s.ipOption.IPv6Enable
+	}
+	if !option.IPv4Enable && !option.IPv6Enable {
+		return nil, dns.ErrEmptyResponse
+	}
+	addrs, err := s.hosts.Lookup(domain, option)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		if addrs == nil {
+			return nil, nil
+		}
+		return nil, dns.ErrEmptyResponse
+	}
+	if len(addrs) == 1 && addrs[0].Family().IsDomain() {
+		return nil, nil
+	}
+	return toNetIP(addrs)
+}
+
 // LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	// Normalize the FQDN form query

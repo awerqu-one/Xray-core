@@ -1,8 +1,10 @@
 package conf_test
 
 import (
+	"strings"
 	"testing"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -156,4 +158,58 @@ func TestVLessInbound(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestUnsupportedVLESSDecryptionOmitsValue(t *testing.T) {
+	const token = "SECRETTOKEN"
+	cases := []string{
+		token,
+		"mlkem768x25519plus.nativ.600s." + token,
+		"mlkem768x25519plus.native.600s." + strings.Repeat(token, 2),
+	}
+	for _, decryption := range cases {
+		_, err := (&VLessInboundConfig{Decryption: decryption}).Build()
+		if err == nil {
+			t.Fatal("unsupported decryption was accepted")
+		}
+		if _, ok := err.(*xerrors.Error); !ok {
+			t.Fatalf("unsupported decryption error type changed: %T", err)
+		}
+		message := err.Error()
+		if !strings.Contains(message, `unsupported "decryption"`) ||
+			strings.Contains(message, token) {
+			t.Fatal("unsupported decryption error should name the failure and omit the value")
+		}
+	}
+}
+
+func TestUnsupportedVLESSEncryptionOmitsValue(t *testing.T) {
+	const token = "SECRETTOKEN"
+	address := new(Address)
+	if err := address.UnmarshalJSON([]byte(`"example.com"`)); err != nil {
+		t.Fatal(err)
+	}
+	cases := []string{
+		token,
+		"mlkem768x25519plus.native.600s." + token,
+	}
+	for _, encryption := range cases {
+		_, err := (&VLessOutboundConfig{
+			Address:    address,
+			Port:       443,
+			Id:         "27848739-7e62-4138-9fd3-098a63964b6b",
+			Encryption: encryption,
+		}).Build()
+		if err == nil {
+			t.Fatal("unsupported encryption was accepted")
+		}
+		if _, ok := err.(*xerrors.Error); !ok {
+			t.Fatalf("unsupported encryption error type changed: %T", err)
+		}
+		message := err.Error()
+		if !strings.Contains(message, `unsupported "encryption"`) ||
+			strings.Contains(message, token) {
+			t.Fatal("unsupported encryption error should name the failure and omit the value")
+		}
+	}
 }

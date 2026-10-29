@@ -549,9 +549,11 @@ func serverHandshake(conn net.Conn, static noise.DHKey, authorize func(clientPub
 		return nil, r.fail("unauthorized", ErrUnauthorized)
 	}
 	// Only after authorize, so that a stranger cannot fill the filter. The key
-	// is the client's identity for the per-client quota.
+	// is the client's identity for the per-client quota. now is the sample the
+	// tag used. The remainder can arrive much later, and a second reading would
+	// move the skew window that sample already accepted.
 	ts := time.Unix(0, int64(binary.BigEndian.Uint64(payload[:timestampSize])))
-	if !replay.Accept(string(hs.PeerStatic()), uc, ts, handshakeClock()) {
+	if !replay.Accept(string(hs.PeerStatic()), uc, ts, now) {
 		return nil, r.fail("replay", ErrReplay)
 	}
 	// The head is remembered only now, after authorize and the replay accept, and before
@@ -703,10 +705,21 @@ func headTag(headKey, serverPub, re, w1 []byte, bucket uint64) []byte {
 	return mac.Sum(nil)[:headTagLen]
 }
 
-// headBucket returns the time bucket of t: its Unix seconds divided by
-// headBucketSeconds.
+// headBucket returns the time bucket of t: the floor of its Unix seconds
+// divided by headBucketSeconds, encoded as a uint64 two's complement.
+// Floor keeps every bucket headBucketSeconds wide and aligned to the epoch,
+// so b-1 and b+1 are the neighboring buckets on both sides of it. A uint64
+// conversion before the division wraps a negative time (2^64 ≡ 16 mod 300)
+// and the tag then rejects a skew the timestamp check still allows.
 func headBucket(t time.Time) uint64 {
-	return uint64(t.Unix()) / headBucketSeconds
+	sec := t.Unix()
+	q := sec / headBucketSeconds
+	// Division truncates toward zero. A negative second that is not on a
+	// bucket boundary belongs one bucket lower.
+	if sec < 0 && sec%headBucketSeconds != 0 {
+		q--
+	}
+	return uint64(q)
 }
 
 // matchHeadTag reports whether tag verifies under the current key and under the

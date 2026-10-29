@@ -33,29 +33,58 @@ func (m *AccessMessage) String() string {
 	builder := strings.Builder{}
 	builder.WriteString("from")
 	builder.WriteByte(' ')
-	builder.WriteString(serial.ToString(m.From))
+	builder.WriteString(sanitizeLogField(serial.ToString(m.From)))
 	builder.WriteByte(' ')
-	builder.WriteString(string(m.Status))
+	builder.WriteString(sanitizeLogField(string(m.Status)))
 	builder.WriteByte(' ')
-	builder.WriteString(serial.ToString(m.To))
+	builder.WriteString(sanitizeLogField(serial.ToString(m.To)))
 
 	if len(m.Detour) > 0 {
 		builder.WriteString(" [")
-		builder.WriteString(m.Detour)
+		builder.WriteString(sanitizeLogField(m.Detour))
 		builder.WriteByte(']')
 	}
 
-	if reason := serial.ToString(m.Reason); len(reason) > 0 {
+	if reason := sanitizeLogField(serial.ToString(m.Reason)); len(reason) > 0 {
 		builder.WriteString(" ")
 		builder.WriteString(reason)
 	}
 
 	if len(m.Email) > 0 {
 		builder.WriteString(" email: ")
-		builder.WriteString(m.Email)
+		builder.WriteString(sanitizeLogField(m.Email))
 	}
 
 	return builder.String()
+}
+
+// sanitizeLogField replaces ASCII controls, including CR, LF, and DEL.
+// One access event stays one line. Text with no controls is returned unchanged,
+// so the spaces between fields of a clean record stay as they are.
+func sanitizeLogField(s string) string {
+	if !hasASCIIControl(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < ' ' || c == 0x7F {
+			b.WriteByte('?')
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func hasASCIIControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] == 0x7F {
+			return true
+		}
+	}
+	return false
 }
 
 func ContextWithAccessMessage(ctx context.Context, accessMessage *AccessMessage) context.Context {

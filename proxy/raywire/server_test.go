@@ -63,6 +63,7 @@ func newProbeServer(t *testing.T, fallback xnet.Destination, clients ...noise.DH
 		policyManager:    fakePolicy{},
 		replay:           newReplayFilterAt(handshakeClock()),
 		adm:              newAdmission(maxPendingHandshakes, maxPendingPerIP),
+		relay:            newAdmission(maxRelays, maxRelaysPerIP),
 	}
 	for _, c := range clients {
 		s.clients[string(c.Public)] = &Account{PublicKey: c.Public}
@@ -426,14 +427,12 @@ func TestNoDecoyClosesAtDecision(t *testing.T) {
 // Row 18 of section 12.2. With every relay slot taken, a failed connection is
 // closed without a dial.
 func TestFullRelayPoolClosesWithoutDial(t *testing.T) {
-	oldAdm := relayAdm
-	relayAdm = newAdmission(1, maxRelaysPerIP)
-	t.Cleanup(func() { relayAdm = oldAdm })
-	if _, ok := relayAdm.TryAcquire("127.0.0.1"); !ok {
-		t.Fatal("new relay pool has no free slot")
-	}
 	dials := countDials(t, errors.New("unexpected dial"))
 	srv := newProbeServer(t, xnet.DestinationFromAddr(startBannerDecoy(t)))
+	srv.relay = newAdmission(1, maxRelaysPerIP)
+	if _, ok := srv.relay.TryAcquire("127.0.0.1"); !ok {
+		t.Fatal("new relay pool has no free slot")
+	}
 
 	o := probeViaServer(t, srv, []byte("GET / HTTP/1.0\r\n\r\n"))
 	if len(o.got) != 0 {
@@ -444,6 +443,26 @@ func TestFullRelayPoolClosesWithoutDial(t *testing.T) {
 	}
 	if n := dials.Load(); n != 0 {
 		t.Fatalf("decoy dialed %d times with a full relay pool", n)
+	}
+}
+
+// A full relay pool on one inbound must not suppress the decoy on another.
+func TestRelayPoolIsPerInbound(t *testing.T) {
+	dials := countDials(t, errors.New("connection refused"))
+	dest := xnet.DestinationFromAddr(startBannerDecoy(t))
+	busy := newProbeServer(t, dest)
+	busy.relay = newAdmission(1, maxRelaysPerIP)
+	if _, ok := busy.relay.TryAcquire("127.0.0.1"); !ok {
+		t.Fatal("new relay pool has no free slot")
+	}
+	other := newProbeServer(t, dest)
+
+	o := probeViaServer(t, other, []byte("GET / HTTP/1.0\r\n\r\n"))
+	if reason := reasonOf(o.serverErr); reason != "prefix" {
+		t.Fatalf("decision = %v, want reason prefix", o.serverErr)
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("second inbound dialed the decoy %d times, want 1", n)
 	}
 }
 

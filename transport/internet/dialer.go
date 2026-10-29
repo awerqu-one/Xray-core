@@ -240,7 +240,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		}
 	}
 	if sockopt == nil {
-		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
+		return dialOwnResolved(ctx, src, dest, sockopt)
 	}
 
 	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
@@ -278,7 +278,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
 	}
 
-	return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
+	return dialOwnResolved(ctx, src, dest, sockopt)
 }
 
 func InitSystemDialer(dc dns.Client, om outbound.Manager) {

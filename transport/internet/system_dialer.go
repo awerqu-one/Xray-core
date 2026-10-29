@@ -244,6 +244,17 @@ func DialerControllers() []func(network, address string, c syscall.RawConn) erro
 	return Controllers
 }
 
+// ApplyDialerControllers runs the registered dialer controllers.
+// The error matches DefaultSystemDialer: the socket must not be used.
+func ApplyDialerControllers(network, address string, c syscall.RawConn) error {
+	for _, ctl := range DialerControllers() {
+		if err := ctl(network, address, c); err != nil {
+			return errors.New("failed to apply external controller").Base(err)
+		}
+	}
+	return nil
+}
+
 type FakePacketConn struct {
 	net.Conn
 }
