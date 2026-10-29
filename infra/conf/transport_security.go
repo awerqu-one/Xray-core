@@ -317,6 +317,7 @@ type TLSConfig struct {
 	ECHServerKeys           string           `json:"echServerKeys"`
 	ECHConfigList           string           `json:"echConfigList"`
 	ECHSocketSettings       *SocketConfig    `json:"echSockopt"`
+	UseSystemCA             bool             `json:"useSystemCA"`
 }
 
 // Build implements Buildable.
@@ -405,6 +406,7 @@ func (c *TLSConfig) Build() (proto.Message, error) {
 		}
 		config.EchSocketSettings = ss
 	}
+	config.UseSystemCa = c.UseSystemCA
 
 	return config, nil
 }
